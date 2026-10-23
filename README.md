@@ -153,6 +153,14 @@ minutes. See [GitHub's manifest flow](https://docs.github.com/en/apps/sharing-gi
 
 ---
 
+## Releases
+
+Releases use the package version declared in `Cargo.toml`. After main's checks
+pass, a new version is tagged and built locally in this repository's workflows;
+no private reusable workflow is required. Release builds cover Linux x86_64
+and arm64, macOS Intel and Apple Silicon, and Windows x86_64. The previous
+release remains available for FreeBSD, Windows arm64 and 32-bit platforms.
+
 ## Configuration
 
 gh-config uses a fully extensible, declarative YAML schema. You can specify any settings supported by the GitHub API, as well as custom fields for automation and policy.
