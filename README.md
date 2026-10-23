@@ -31,6 +31,7 @@ A fast, declarative CLI tool to manage GitHub organization configuration as code
 - **Diff mode**: See what would change before applying.
 - **Dry run**: Validate changes without modifying anything.
 - **Sync from org**: Generate a config file from your current GitHub org state.
+- **GitHub Apps**: Validate versioned manifests and register org-owned Apps through GitHub's browser approval flow.
 - **Cross-platform**: Linux, macOS, Windows.
 - **Fast**: Built in Rust.
 - **Easy CI integration**: Automate validation and updates.
@@ -117,6 +118,31 @@ gh-config --token <your-pat> sync config.yaml --dry-run
 ```bash
 gh-config --token <your-pat> sync-from-org config.yaml --org gitkb
 ```
+
+- **Register an organization-owned GitHub App:**
+
+```bash
+gh-config app validate --manifest apps/rabbit.json
+gh-config app create --org gitkb --manifest apps/rabbit.json \
+  --credentials-dir "$HOME/rabbit-app-credentials"
+```
+
+Open the printed loopback URL in a browser signed into GitHub with permission
+to create Apps under the organization. Confirm the organization on GitHub's
+creation page. The CLI rejects personal-account fallback, validates the
+callback state, exchanges the one-time code and saves `credentials.json`,
+`private-key.pem` and nonsecret `app.json`. No PAT is required or sent by these
+App commands. The manifest's `redirect_url` is replaced with the local callback.
+
+Credential output requires Unix, a new directory outside Git and an existing
+parent. The directory is mode 0700; files are mode 0600 and never overwritten.
+Move the secret files into your team's secret manager. Do not commit them or
+upload them as CI artifacts. Keep only the manifest in your org-config repo.
+
+App registration is a browser-approved operation; an owner PAT in Actions does
+not bypass GitHub's registration page. Install the resulting App separately
+using the printed installation URL. Registration expires locally after 15
+minutes. See [GitHub's manifest flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest).
 
 ### Example diff output
 
