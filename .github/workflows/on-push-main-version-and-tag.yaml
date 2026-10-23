@@ -1,27 +1,46 @@
-name: On Push to Main, Version and Tag For Release
+name: Validate main and release its declared version
 on:
   push:
     branches:
     - main
 
 permissions:
-  packages: write
-  contents: write
+  contents: read
 
 jobs:
   quality:
-    uses: gitkb/workflows-rust/.github/workflows/quality.yaml@v1.1.0
-    with:
-      cargo_incremental: true
-
-
-  # This uses commit logs and tags from git to determine the next version number and create a tag for the release
-  # Some commits such are chore: will not trigger a version bump and tag! This is by design.
-  version-and-tag:
-    name: Version and Tag
+    uses: ./.github/workflows/quality.yaml
+  tag:
     needs: quality
-    uses: gitkb/workflow-vnext-tag/.github/workflows/workflow.yaml@v1.5.0
-    secrets: inherit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag a new Cargo package version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+          else
+            git tag "$tag"
+            git push origin "$tag"
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          fi
+  release:
+    needs: tag
+    if: needs.tag.outputs.publish == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/on-v-tag-release.yaml
     with:
-      useDeployKey: true
-      rust: true
+      ref: ${{ needs.tag.outputs.tag }}

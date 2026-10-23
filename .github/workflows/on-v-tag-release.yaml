@@ -1,15 +1,94 @@
-name: On Version Tagged, Build and Publish Rust Binaries
+name: Build release binaries
 on:
   push:
     tags:
     - "v*.*.*"
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Existing release tag to build
+        type: string
+        required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    uses: gitkb/workflows-rust/.github/workflows/release.yaml@v1.1.0
-    with:
-      binary_name: gh-config
-      build_args: "--release --features vendored"
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: gh-config-Linux-gnu-x86_64.tar.gz
+          - os: ubuntu-22.04-arm
+            asset: gh-config-Linux-gnu-aarch64.tar.gz
+          - os: macos-15
+            asset: gh-config-macOS-arm64.tar.gz
+          - os: macos-15-intel
+            asset: gh-config-macOS-x86_64.tar.gz
+          - os: windows-latest
+            asset: gh-config-Windows-msvc-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release --bin gh-config
+      - name: Package binary and checksum
+        shell: bash
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          python - <<'PY'
+          import hashlib, os, pathlib, tarfile, zipfile
+          asset = os.environ['ASSET']
+          output = pathlib.Path('dist')
+          output.mkdir()
+          binary = pathlib.Path('target/release/gh-config' + ('.exe' if asset.endswith('.zip') else ''))
+          archive = output / asset
+          if asset.endswith('.zip'):
+              with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
+                  z.write(binary, binary.name)
+          else:
+              with tarfile.open(archive, 'w:gz') as t:
+                  t.add(binary, arcname=binary.name)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          archive.with_name(asset + '.sha256').write_text(f'{digest}  {asset}\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gh-config-*
+          merge-multiple: true
+          path: dist
+      - name: Publish the verified tag's binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_REF: ${{ inputs.ref || github.ref_name }}
+        run: |
+          [[ "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if ! gh release view "$RELEASE_REF" >/dev/null 2>&1; then
+            gh release create "$RELEASE_REF" --verify-tag --generate-notes
+          fi
+          gh release upload "$RELEASE_REF" dist/* --clobber
