@@ -52,12 +52,14 @@ pub fn load_manifest(path: &Path) -> Result<Value> {
     );
     let manifest: Value = serde_json::from_slice(&bytes).context("Invalid manifest JSON")?;
     ensure!(manifest.is_object(), "Manifest must be a JSON object");
+    let name = manifest
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("Manifest requires a nonempty name"))?;
     ensure!(
-        manifest
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty()),
-        "Manifest requires a nonempty name"
+        name.chars().all(|c| c.len_utf8() <= 3),
+        "GitHub App names cannot contain 4-byte Unicode characters; use emoji in the description instead"
     );
     let homepage = manifest
         .get("url")
@@ -529,12 +531,21 @@ mod tests {
         let file = temp.path().join("manifest.json");
         fs::write(
             &file,
-            json!({"name":"Rabbit 🐇", "url":"https://gitkb.com",
+            json!({"name":"Rabbit", "description":"Rabbit 🐇", "url":"https://gitkb.com",
             "default_permissions":{"contents":"read","pull_requests":"write"}})
             .to_string(),
         )
         .unwrap();
         assert!(load_manifest(&file).is_ok());
+        fs::write(
+            &file,
+            json!({"name":"Rabbit 🐇", "url":"https://gitkb.com"}).to_string(),
+        )
+        .unwrap();
+        assert!(load_manifest(&file)
+            .unwrap_err()
+            .to_string()
+            .contains("4-byte Unicode"));
         for invalid in [
             json!([]),
             json!({"name":"", "url":"https://gitkb.com"}),
