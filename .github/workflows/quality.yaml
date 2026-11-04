@@ -13,3 +13,5 @@ jobs:
       - run: cargo build --locked
       - run: cargo test --locked --all-features
       - run: cargo xtask gen-api-mappings --check
+      # Enforces the deny lints in Cargo.toml (no panics in non-test code); style warnings don't fail.
+      - run: cargo clippy --locked --all-targets --all-features
