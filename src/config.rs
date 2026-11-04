@@ -1,9 +1,7 @@
-///
-/// Configuration models for gh-config-cli.
-///
-/// This module defines the data structures used for representing repository, team, user, and webhook
-/// configuration. All structs are serializable/deserializable for use with YAML and JSON configuration files.
-///
+//! Configuration models for gh-config-cli.
+//!
+//! This module defines the data structures used for representing repository, team, user, and webhook
+//! configuration. All structs are serializable/deserializable for use with YAML and JSON configuration files.
 
 use serde::{Deserialize, Serialize};
 

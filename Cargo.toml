@@ -11,6 +11,31 @@ authors = ["@mateodelnorte"]
 [workspace]
 members = [".", "xtask"]
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "forbid"
+unconditional_recursion = "forbid"
+
+# Non-test code must not panic. Tests may (clippy.toml).
+[workspace.lints.clippy]
+suspicious = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+unused_result_ok = "deny"
+let_underscore_must_use = "deny"
+let_underscore_future = "deny"
+await_holding_lock = "deny"
+
+[lints]
+workspace = true
+
 [[bin]]
 name = "gh-config"
 path = "src/main.rs"

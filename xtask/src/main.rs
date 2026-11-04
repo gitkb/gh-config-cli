@@ -48,8 +48,12 @@ fn run(args: Vec<String>) -> Result<()> {
             .status()
             .map_err(|e| format!("running curl: {e}"))?;
         if !status.success() {
-            // Best effort: a partial download is useless, and no file there is fine too.
-            let _ = fs::remove_file(&tmp);
+            // A partial download is useless; curl may also have written nothing at all.
+            if let Err(e) = fs::remove_file(&tmp) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("xtask: could not remove {}: {e}", tmp.display());
+                }
+            }
             return Err(format!("downloading {SCHEMA_URL} failed: curl {status}"));
         }
         rename(&tmp, &schema)?;

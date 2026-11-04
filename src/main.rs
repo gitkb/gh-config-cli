@@ -24,6 +24,13 @@ enum Command {
         #[command(subcommand)]
         command: AppCommand,
     },
+    #[command(flatten)]
+    Org(OrgCommand),
+}
+
+/// Commands that read or change an organization and need a token.
+#[derive(Subcommand, Debug)]
+enum OrgCommand {
     /// Show a line-numbered diff between GitHub state and local config file
     Diff {
         /// Path to the config file
@@ -87,100 +94,94 @@ async fn main() {
 
 async fn run() -> AppResult<bool> {
     let args = Args::parse();
-
-    let (command, config_path, _dry_run, _org) = match &args.command {
-        Command::App { command } => {
-            let result = match command {
-                AppCommand::Validate { manifest } => {
-                    github_app::load_manifest(manifest).map(|_| println!("App manifest is valid"))
-                }
-                AppCommand::Create {
-                    org,
-                    manifest,
-                    credentials_dir,
-                } => github_app::create(org, manifest, credentials_dir)
-                    .await
-                    .map(|app| {
-                        println!("Created {} (App ID {})", app.slug, app.id);
-                        println!(
-                            "Install: https://github.com/apps/{}/installations/new",
-                            app.slug
-                        );
-                        println!(
-                            "Credentials saved privately in {}",
-                            credentials_dir.display()
-                        );
-                    }),
-            };
-            return result
-                .map(|_| false)
-                .map_err(|e| error::AppError::GitHubApi(e.to_string()));
+    match args.command {
+        Command::App { command } => run_app(command)
+            .await
+            .map(|()| false)
+            .map_err(|e| error::AppError::GitHubApi(e.to_string())),
+        Command::Org(command) => {
+            let token = args
+                .token
+                .as_deref()
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| {
+                    error::AppError::GitHubApi(
+                        "Set GITHUB_TOKEN or --token for organization sync commands".into(),
+                    )
+                })?;
+            run_org(token, command).await
         }
-        Command::Diff { config } => ("diff", config, false, None),
-        Command::Sync { config, dry_run } => ("sync", config, *dry_run, None),
-        Command::SyncFromOrg {
+    }
+}
+
+async fn run_app(command: AppCommand) -> anyhow::Result<()> {
+    match command {
+        AppCommand::Validate { manifest } => {
+            github_app::load_manifest(&manifest)?;
+            println!("App manifest is valid");
+        }
+        AppCommand::Create {
+            org,
+            manifest,
+            credentials_dir,
+        } => {
+            let app = github_app::create(&org, &manifest, &credentials_dir).await?;
+            println!("Created {} (App ID {})", app.slug, app.id);
+            println!(
+                "Install: https://github.com/apps/{}/installations/new",
+                app.slug
+            );
+            println!(
+                "Credentials saved privately in {}",
+                credentials_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Returns whether differences were found (only `diff` reports any).
+async fn run_org(token: &str, command: OrgCommand) -> AppResult<bool> {
+    match command {
+        OrgCommand::Diff { config } => {
+            info!("Starting gh-config-cli with command: diff, config: {}", config);
+            client_for_config(token, &config)?.diff(&config).await
+        }
+        OrgCommand::Sync { config, dry_run } => {
+            info!("Starting gh-config-cli with command: sync, config: {}", config);
+            client_for_config(token, &config)?
+                .sync(&config, dry_run)
+                .await?;
+            Ok(false)
+        }
+        OrgCommand::SyncFromOrg {
             config,
             dry_run,
             org,
-        } => ("sync-from-org", config, *dry_run, Some(org)),
-    };
-
-    let token = args
-        .token
-        .as_deref()
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| {
-            error::AppError::GitHubApi(
-                "Set GITHUB_TOKEN or --token for organization sync commands".into(),
-            )
-        })?;
-
-    info!(
-        "Starting gh-config-cli with command: {}, config: {}",
-        command, config_path
-    );
-
-    let mut client = match &args.command {
-        Command::SyncFromOrg {
-            config: _,
-            dry_run: _,
-            org,
-        } => GitHubClient::new(token, org),
-        _ => {
-            // Load config first for Diff and Sync
-            let config = Config::from_file_with_defaults(config_path, None)?;
-
-            // --- Add Org Check ---
-            if config.org.trim().is_empty() {
-                error!("Configuration file '{}' is missing the required 'org' key or its value is empty.", config_path);
-                // Use a specific error type if available, or a general one.
-                // Using GitHubApi might be slightly misleading, but fits AppError enum.
-                return Err(error::AppError::GitHubApi(
-                    "Missing or empty 'org' key in configuration file.".to_string(),
-                ));
-            }
-            // --- End Org Check ---
-
-            GitHubClient::new(token, &config.org)
-        }
-    };
-
-    match args.command {
-        Command::App { .. } => unreachable!("App commands return before organization sync"),
-        Command::Diff { config: _ } => client.diff(config_path).await,
-        Command::Sync { config: _, dry_run } => {
-            client.sync(config_path, dry_run).await?;
-            Ok(false) // Sync completed, no diffs to report
-        }
-        Command::SyncFromOrg {
-            config: _,
-            dry_run,
-            org: _,
         } => {
-            client
-                .generate_config_and_write(config_path, dry_run)
+            info!(
+                "Starting gh-config-cli with command: sync-from-org, config: {}",
+                config
+            );
+            GitHubClient::new(token, &org)
+                .generate_config_and_write(&config, dry_run)
                 .await?;
-            Ok(false) // Sync-from-org completed, no diffs to report
+            Ok(false)
         }
     }
+}
+
+/// A client for the org named in the config file, which must name one.
+fn client_for_config(token: &str, config_path: &str) -> AppResult<GitHubClient> {
+    let config = Config::from_file_with_defaults(config_path, None)?;
+    if config.org.trim().is_empty() {
+        error!(
+            "Configuration file '{}' is missing the required 'org' key or its value is empty.",
+            config_path
+        );
+        return Err(error::AppError::GitHubApi(
+            "Missing or empty 'org' key in configuration file.".to_string(),
+        ));
+    }
+    Ok(GitHubClient::new(token, &config.org))
 }
