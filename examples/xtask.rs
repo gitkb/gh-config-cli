@@ -1,4 +1,4 @@
-//! Development tasks for gh-config. Run from anywhere in the workspace:
+//! Development tasks for gh-config, run as `cargo xtask …` (an alias for this example):
 //!
 //! - `cargo xtask gen-api-mappings`: regenerate `src/github_api_mapping_generated.rs`
 //!   from the pinned schema in `mappings/github-openapi.json`.
@@ -36,31 +36,15 @@ fn run(args: Vec<String>) -> Result<()> {
         ["gen-api-mappings", "--check"] => (false, true),
         _ => return Err(USAGE.into()),
     };
-    let root = workspace_root()?;
+    let root = manifest_dir()?;
     let schema = root.join(SCHEMA);
     let generated = root.join(GENERATED);
-    if fetch {
-        let tmp = schema.with_extension("json.download");
-        let status = Command::new("curl")
-            .args(["--fail", "--location", "--silent", "--show-error", "--output"])
-            .arg(&tmp)
-            .arg(SCHEMA_URL)
-            .status()
-            .map_err(|e| format!("running curl: {e}"))?;
-        if !status.success() {
-            // A partial download is useless; curl may also have written nothing at all.
-            if let Err(e) = fs::remove_file(&tmp) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("xtask: could not remove {}: {e}", tmp.display());
-                }
-            }
-            return Err(format!("downloading {SCHEMA_URL} failed: curl {status}"));
-        }
-        rename(&tmp, &schema)?;
-    }
-    let text = fs::read_to_string(&schema).map_err(|e| format!("reading {}: {e}", schema.display()))?;
-    let spec: Value = serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", schema.display()))?;
-    let output = render(&spec)?;
+    // A fetched schema replaces the pinned one only once it has rendered.
+    let source = if fetch { download(&schema)? } else { schema.clone() };
+    let output = render_file(&source).map_err(|e| match fetch {
+        true => format!("{e} (download kept at {})", source.display()),
+        false => e,
+    })?;
     if check {
         let current = fs::read_to_string(&generated).map_err(|e| format!("reading {}: {e}", generated.display()))?;
         return if current == output {
@@ -71,16 +55,44 @@ fn run(args: Vec<String>) -> Result<()> {
     }
     let tmp = generated.with_extension("rs.tmp");
     fs::write(&tmp, output).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    if fetch {
+        rename(&source, &schema)?;
+    }
     rename(&tmp, &generated)
 }
 
+/// Downloads the latest schema next to the pinned one and returns its path.
+fn download(schema: &Path) -> Result<PathBuf> {
+    let tmp = schema.with_extension("json.download");
+    let status = Command::new("curl")
+        .args(["--fail", "--location", "--silent", "--show-error", "--output"])
+        .arg(&tmp)
+        .arg(SCHEMA_URL)
+        .status()
+        .map_err(|e| format!("running curl: {e}"))?;
+    if status.success() {
+        return Ok(tmp);
+    }
+    // A partial download is useless; curl may also have written nothing at all.
+    if let Err(e) = fs::remove_file(&tmp) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("xtask: could not remove {}: {e}", tmp.display());
+        }
+    }
+    Err(format!("downloading {SCHEMA_URL} failed: curl {status}"))
+}
+
+fn render_file(schema: &Path) -> Result<String> {
+    let text = fs::read_to_string(schema).map_err(|e| format!("reading {}: {e}", schema.display()))?;
+    let spec: Value = serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", schema.display()))?;
+    render(&spec)
+}
+
 /// Read at run time, not build time, so a binary built from another checkout never writes here.
-fn workspace_root() -> Result<PathBuf> {
-    let xtask = env::var_os("CARGO_MANIFEST_DIR").ok_or("run this through `cargo xtask`")?;
-    Path::new(&xtask)
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| format!("{} has no parent directory", Path::new(&xtask).display()))
+fn manifest_dir() -> Result<PathBuf> {
+    env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| "run this through `cargo xtask`".to_string())
 }
 
 fn rename(from: &Path, to: &Path) -> Result<()> {

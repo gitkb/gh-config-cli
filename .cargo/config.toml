@@ -1,2 +1,3 @@
 [alias]
-xtask = "run --locked -p xtask --"
+# An example, not a package: a second package with binaries would break `cargo install --git`.
+xtask = "run --locked --example xtask --"
