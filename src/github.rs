@@ -973,7 +973,11 @@ impl GitHubClient {
             };
 
             let visibility = if repo["private"].as_bool().unwrap_or(false) { Some("private".to_string()) } else { Some("public".to_string()) };
-            let webhooks = self.get_webhooks(&name).await.unwrap_or_default(); // Handle potential error
+            // Like settings above: report the repo and carry on, so one unreadable repo doesn't hide the rest.
+            let webhooks = self.get_webhooks(&name).await.unwrap_or_else(|e| {
+                error!("Failed to fetch webhooks for repo {}: {}. Its webhook is left out.", name, e);
+                Vec::new()
+            });
             let webhook = webhooks.first().map(|wh| WebhookConfig {
                 url: wh.config.url.clone(),
                 content_type: wh.config.content_type.clone(),
