@@ -25,15 +25,6 @@ use std::io::Write;
 const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct RepoResponse {
-    allow_merge_commit: bool,
-    allow_squash_merge: bool,
-    allow_rebase_merge: bool,
-    private: bool,
-}
-
-#[derive(Debug, Deserialize)]
 struct TeamResponse {
     name: String,
 }
@@ -332,20 +323,6 @@ impl GitHubClient {
             }
         }
         Ok(settings)
-    }
-
-    #[allow(dead_code)]
-    async fn get_repo_visibility(&self, repo_name: &str) -> AppResult<String> {
-        let full_url = format!("{}/repos/{}/{}", GITHUB_API_BASE_URL, self.org, repo_name);
-        let response = self.get(&full_url).await?;
-        let text = response.text().await?;
-        if text.is_empty() {
-            error!("Empty response body from GET {}", full_url);
-            return Err(AppError::GitHubApi("Empty response body".to_string()));
-        }
-        let repo: RepoResponse = serde_json::from_str(&text)
-            .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", full_url, e)))?;
-        Ok(if repo.private { "private" } else { "public" }.to_string())
     }
 
     async fn get_team(&self, team_name: &str) -> AppResult<Option<TeamResponse>> {
