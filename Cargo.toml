@@ -8,13 +8,12 @@ documentation = "https://docs.rs/gh-config"
 keywords = ["cli", "context", "ai", "rust", "project", "tool"]
 authors = ["@mateodelnorte"]
 
+[workspace]
+members = [".", "xtask"]
+
 [[bin]]
 name = "gh-config"
 path = "src/main.rs"
-
-[[bin]]
-name = "generate-api-mappings"
-path = "scripts/generate_api_mapping.rs"
 
 [dependencies]
 anyhow = "1.0.98"

@@ -17,12 +17,6 @@ diff:
 dry-run:
 	@GITHUB_TOKEN=$(GITHUB_TOKEN) RUST_LOG=$(RUST_LOG) cargo run --bin gh-config -- sync $(CONFIG_FILE) --dry-run
 
-generate-api-mappings:
-	# @GITHUB_TOKEN=$(GITHUB_TOKEN) RUST_LOG=$(RUST_LOG) cargo run --bin generate-api-mappings -- github-openapi.json
-	curl -L -o mappings/github-openapi.json https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json
-	cargo run --bin generate-api-mappings -- mappings/github-openapi.json > src/github_api_mapping_generated.rs
-	@echo "Mappings generated. Integrate as needed."
-
 help:
 	@cargo run -- --help
 
@@ -41,5 +35,3 @@ sync-from-github:
 
 test:
 	cargo test
-
-update-api-mappings: generate-api-mappings

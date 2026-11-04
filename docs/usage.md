@@ -150,7 +150,7 @@ gh-config supports a fully extensible configuration schema. You can declarativel
 
 - The tool uses a mapping generated from the GitHub OpenAPI spec to translate config keys to API endpoints and payloads.
 - To add a new setting, just add the field to your config. If it's supported by the GitHub API and present in the mapping, it will be managed automatically.
-- To update the mapping, run `make update-github-api-mappings` to fetch the latest API spec and regenerate the mapping.
+- To update the mapping, run `cargo xtask gen-api-mappings --fetch` to fetch the latest API spec and regenerate the mapping (without `--fetch` it regenerates from the pinned spec in `mappings/`).
 
 ### Troubleshooting
 
