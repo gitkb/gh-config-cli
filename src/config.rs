@@ -1,9 +1,7 @@
-///
-/// Configuration models for gh-config-cli.
-///
-/// This module defines the data structures used for representing repository, team, user, and webhook
-/// configuration. All structs are serializable/deserializable for use with YAML and JSON configuration files.
-///
+//! Configuration models for gh-config-cli.
+//!
+//! This module defines the data structures used for representing repository, team, user, and webhook
+//! configuration. All structs are serializable/deserializable for use with YAML and JSON configuration files.
 
 use serde::{Deserialize, Serialize};
 
@@ -245,34 +243,6 @@ fn merge_with_defaults(main: Value, defaults: Value) -> Value {
             Value::Sequence(merged)
         }
         (main, _) => main, // If not both mappings or sequences, main wins
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-///
-/// Branch protection settings for a repository.
-///
-/// Represents enforcement options for admins, deletions, and force pushes for a branch.
-///
-pub struct BranchProtection {
-    /// Whether to enforce admin restrictions.
-    #[serde(default)]
-    pub enforce_admins: bool,
-    /// Whether to allow branch deletions.
-    #[serde(default)]
-    pub allow_deletions: bool,
-    /// Whether to allow force pushes.
-    #[serde(default)]
-    pub allow_force_pushes: bool,
-}
-
-impl Default for BranchProtection {
-    fn default() -> Self {
-        BranchProtection {
-            enforce_admins: true,
-            allow_deletions: false,
-            allow_force_pushes: false,
-        }
     }
 }
 

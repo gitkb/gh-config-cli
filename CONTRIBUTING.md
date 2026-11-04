@@ -31,6 +31,10 @@ Thank you for your interest in contributing! We welcome issues, feature requests
 cargo test
 ```
 
+## Generated code
+
+`src/github_api_mapping_generated.rs` is generated from the pinned GitHub OpenAPI spec in `mappings/`. Regenerate it with `cargo xtask gen-api-mappings` (add `--fetch` to download the latest spec first); CI runs `cargo xtask gen-api-mappings --check`.
+
 ## Linting
 
 ```bash

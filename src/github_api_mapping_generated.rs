@@ -1,5 +1,5 @@
 // AUTO-GENERATED FILE. DO NOT EDIT BY HAND.
-// Please run `make generate-api-mappings` to regenerate.
+// Please run `cargo xtask gen-api-mappings` to regenerate.
 // This generator prioritizes PATCH /repos/{owner}/{repo} for repo settings.
 // WARNING: Collisions for other keys might still use the *last processed* mapping.
 use std::collections::HashMap;

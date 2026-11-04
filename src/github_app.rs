@@ -5,14 +5,14 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use axum::{
     extract::{rejection::QueryRejection, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
     Router,
@@ -92,7 +92,9 @@ pub async fn create(org: &str, manifest_path: &Path, credentials_dir: &Path) -> 
     if result.is_err() {
         // Only remove our newly reserved directory if it is still empty. A
         // partially written credential is retained for recovery, never deleted.
-        let _ = fs::remove_dir(credentials_dir);
+        if let Err(e) = fs::remove_dir(credentials_dir) {
+            log::debug!("Kept {}: {e}", credentials_dir.display());
+        }
     }
     result
 }
@@ -112,9 +114,8 @@ async fn register(org: &str, manifest: &mut Value, credentials_dir: &Path) -> Re
     let (stop_tx, stop_rx) = oneshot::channel();
     let mut server = tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = stop_rx.await;
-            })
+            // A dropped sender means stop too.
+            .with_graceful_shutdown(async { stop_rx.await.unwrap_or_default() })
             .await
     });
     println!("Open http://{host}/setup/{state} in your browser.");
@@ -136,7 +137,8 @@ async fn register(org: &str, manifest: &mut Value, credentials_dir: &Path) -> Re
         save_credentials(credentials_dir, org, &credentials)
     }
     .await;
-    let _ = stop_tx.send(());
+    // Fails only when the server already stopped, which is the goal anyway.
+    stop_tx.send(()).unwrap_or_default();
     // A browser keepalive must not keep the CLI alive after the handshake.
     if tokio::time::timeout(Duration::from_secs(2), &mut server)
         .await
@@ -204,7 +206,8 @@ async fn registration_callback(
     if !valid_host(&headers, &s.host) || query.state != s.state || !valid_code(&query.code) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let sender = s.callback.lock().expect("callback lock poisoned").take();
+    // Poisoning can't leave an Option half-taken, so a poisoned lock is still safe to use.
+    let sender = s.callback.lock().unwrap_or_else(PoisonError::into_inner).take();
     if sender.is_some_and(|sender| sender.send(query.code).is_ok()) {
         private_response(
             Html("Authorization received. Return to the terminal for the registration result.")
@@ -221,10 +224,10 @@ fn valid_host(headers: &HeaderMap, expected: &str) -> bool {
 
 fn private_response(mut response: Response) -> Response {
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    headers.insert(header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; form-action https://github.com; frame-ancestors 'none'; base-uri 'none'".parse().unwrap());
-    headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
+        "default-src 'none'; form-action https://github.com; frame-ancestors 'none'; base-uri 'none'"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     response
 }
 

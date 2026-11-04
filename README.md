@@ -73,6 +73,12 @@ curl --silent --location https://raw.githubusercontent.com/houseabsolute/ubi/mas
 
 Download the latest binary for your platform from [Releases](https://github.com/gitkb/gh-config-cli/releases), make it executable, and put it in your PATH.
 
+### With Cargo
+
+```bash
+cargo install --locked --git https://github.com/gitkb/gh-config-cli
+```
+
 ### From Source
 
 Requires Rust stable:
