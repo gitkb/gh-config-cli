@@ -1155,14 +1155,9 @@ impl GitHubClient {
     pub async fn diff(&self, config_path: &str) -> AppResult<bool> {
         info!("Generating diff between full GitHub org state and local config: {} (this matches what sync-from-github would write)", config_path);
 
-        // --- Step 1: Load original local config & track explicit webhooks ---
+        // --- Step 1: Load original local config ---
         let local_config = crate::config::Config::from_file_with_defaults(config_path, None)?;
         let local_default_webhook = local_config.default_webhook.clone();
-        // Keep track of original explicit webhooks
-        let originally_explicit_webhooks: HashSet<String> = local_config.repos.iter()
-            .filter(|r| r.webhook.is_some())
-            .map(|r| r.name.clone())
-            .collect();
 
         // --- Step 2: Fetch FULL GitHub org state (unfiltered, as sync-from-github would write) ---
         let github_config = self.generate_unfiltered_config_from_org().await?;
