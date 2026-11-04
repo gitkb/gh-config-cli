@@ -1,14 +1,8 @@
-mod api_mapping;
-mod config;
-mod error;
-mod github;
-mod github_api_mapping_generated;
-
 use clap::{Parser, Subcommand};
-use config::Config;
-use error::AppResult;
+use gh_config::config::Config;
+use gh_config::error::{self, AppResult};
+use gh_config::github::GitHubClient;
 use gh_config::github_app;
-use github::GitHubClient;
 use log::{error, info};
 use std::process;
 
