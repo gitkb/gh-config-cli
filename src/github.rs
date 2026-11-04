@@ -49,7 +49,7 @@ struct PermissionDetails {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WebhookResponse {
-    id: Option<i64>,
+    id: i64,
     url: String,
     config: WebhookConfigResponse,
     events: Vec<String>,
@@ -458,7 +458,7 @@ impl GitHubClient {
         } else {
             match existing {
                 Some(hook) if hook.events != webhook.events || hook.config.content_type != webhook.content_type => {
-                    self.update_webhook(repo_name, hook.id.unwrap(), webhook).await?;
+                    self.update_webhook(repo_name, hook.id, webhook).await?;
                 }
                 Some(_) => debug!("Webhook for {}/{} already up to date", self.org, repo_name),
                 None => self.create_webhook(repo_name, webhook).await?,
@@ -1314,11 +1314,18 @@ mod tests {
 
             assert_eq!(hooks.len(), 1);
             let hook = &hooks[0];
-            assert_eq!(hook.id, Some(123));
+            assert_eq!(hook.id, 123);
             assert_eq!(hook.url, "http://api.github.com/hook/123");
             assert_eq!(hook.config.url, "http://example.com");
             assert_eq!(hook.config.content_type, "json");
             assert_eq!(hook.events, vec!["push", "pull_request"]);
         });
+    }
+
+    #[test]
+    fn webhook_without_id_is_rejected() {
+        let body = r#"[{"url": "u", "config": {"url": "http://example.com", "content_type": "json"}, "events": []}]"#;
+        let err = serde_json::from_str::<Vec<WebhookResponse>>(body).expect_err("a hook without an id must not parse");
+        assert!(err.to_string().contains("missing field `id`"), "{err}");
     }
 }
