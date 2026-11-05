@@ -582,14 +582,14 @@ impl GitHubClient {
     }
 
     async fn set_archived(&self, repo: &str, archived: bool, dry_run: bool) -> AppResult<()> {
-        let verb = if archived { "archive" } else { "unarchive" };
+        let (verb, done) = if archived { ("archive", "Archived") } else { ("unarchive", "Unarchived") };
         if dry_run {
             info!("[Dry Run] Would {} {}/{}", verb, self.org, repo);
             return Ok(());
         }
         let url = format!("{}/repos/{}/{}", self.api_url, self.org, repo);
         self.send_patch(&url, json!({ ARCHIVED: archived })).await?;
-        info!("{}d {}/{}", verb, self.org, repo);
+        info!("{} {}/{}", done, self.org, repo);
         Ok(())
     }
 
@@ -1166,7 +1166,17 @@ impl GitHubClient {
         }
 
         // Assignments
-        for assignment in config.assignments.iter().filter(|a| !stays_archived.contains(a.repo.as_str())) {
+        // Team access can name repos the config doesn't list; those are checked on GitHub once each.
+        let mut checked: HashSet<&str> = config.repos.iter().map(|r| r.name.as_str()).collect();
+        for assignment in &config.assignments {
+            let repo = assignment.repo.as_str();
+            if checked.insert(repo) && archived(&self.get_repo_settings(repo).await?, repo)? == Some(true) {
+                info!("Skipping team access to {}/{}: it is archived. List it under `repos` with `{}: false` to unarchive it.", self.org, repo, ARCHIVED);
+                stays_archived.insert(repo);
+            }
+            if stays_archived.contains(repo) {
+                continue;
+            }
             info!("Processing assignment: Team '{}' on Repo '{}'", assignment.team, assignment.repo); // Add similar logging
             self.assign_team_to_repo(assignment, dry_run).await?;
         }
@@ -1198,17 +1208,12 @@ impl GitHubClient {
         let mut diff_local_config = local_config.clone(); // Clone original local config
         let mut diff_github_config = github_config;      // Use the fetched FULL GitHub org state
 
-        // Show `archived` the way sync treats it: a repo whose local config leaves it out keeps its state,
-        // so it's no difference; where the config names it, compare against GitHub's real value (false included).
-        for remote in &mut diff_github_config.repos {
-            match diff_local_config.repos.iter().find(|r| r.name == remote.name) {
-                Some(local) if local.settings.contains_key(ARCHIVED) => {
-                    remote.settings.entry(ARCHIVED.to_string()).or_insert(serde_yaml::Value::Bool(false));
-                }
-                Some(_) => {
-                    remote.settings.remove(ARCHIVED);
-                }
-                None => {}
+        // GitHub's side leaves out `archived: false`; where the local config names it, show the real value.
+        // A repo archived on GitHub whose config leaves `archived` out still shows `- archived: true`:
+        // like any setting, that's what sync-from-org would add.
+        for local in diff_local_config.repos.iter().filter(|r| r.settings.contains_key(ARCHIVED)) {
+            if let Some(remote) = diff_github_config.repos.iter_mut().find(|r| r.name == local.name) {
+                remote.settings.entry(ARCHIVED.to_string()).or_insert(serde_yaml::Value::Bool(false));
             }
         }
 
@@ -1457,7 +1462,7 @@ mod tests {
         assert!(!client.diff(path).await.expect("diff"), "`archived: false` on an unarchived repo is a difference:\n{explicit}");
 
         std::fs::write(path, generated.replace("    archived: true\n", "")).expect("write config");
-        assert!(!client.diff(path).await.expect("diff"), "leaving out `archived` (which sync leaves alone) is a difference");
+        assert!(client.diff(path).await.expect("diff"), "an archived repo missing from the config is not shown, though sync-from-org would add it");
 
         std::fs::write(path, generated.replace("    archived: true\n", "    archived: false\n")).expect("write config");
         assert!(client.diff(path).await.expect("diff"), "an unarchive is not shown as a difference");
@@ -1469,8 +1474,8 @@ mod tests {
     #[tokio::test]
     async fn sync_unarchives_first_archives_last_and_leaves_archived_repos_alone() {
         let mut server = mockito::Server::new_async().await;
-        // kept stays archived, going gets archived, back gets unarchived.
-        let _mocks = mock_org(&mut server, &[("kept", true), ("going", false), ("back", true)]).await;
+        // kept stays archived, going gets archived, back gets unarchived; hidden is archived and only has team access.
+        let _mocks = mock_org(&mut server, &[("kept", true), ("going", false), ("back", true), ("hidden", true)]).await;
         let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let mut write_mocks = Vec::new();
         for (method, path) in [
@@ -1516,6 +1521,7 @@ repos:
 assignments:
 - {repo: going, team: devs, permission: push}
 - {repo: kept, team: devs, permission: push}
+- {repo: hidden, team: devs, permission: push}
 ",
         );
         let path = config.path().to_str().expect("utf-8 path");

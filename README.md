@@ -209,8 +209,8 @@ repos:
 
 - `sync-from-org` writes `archived: true` for repos that are archived on GitHub, and nothing for the others.
 - `sync` unarchives a repo before changing anything else on it, and archives repos after every other change, because GitHub makes an archived repo read-only.
-- A repo that is archived on GitHub and has no `archived: false` is left alone: its settings, webhook and team access aren't changed, and `sync` logs one line saying so. Leaving `archived` out never unarchives a repo.
-- `diff` shows archiving and unarchiving as a change to the `archived` line.
+- A repo that is archived on GitHub and has no `archived: false` is left alone: its settings, webhook and team access aren't changed, and `sync` logs one line saying so (shown with `RUST_LOG=info`, like its other per-change lines). Leaving `archived` out never unarchives a repo.
+- `diff` shows archiving and unarchiving as a change to the `archived` line. A repo archived on GitHub whose config leaves `archived` out shows `- archived: true` alone: the config doesn't record it yet (sync-from-org would add it), and `sync` leaves the repo archived.
 
 ### Defaults and Merging
 
