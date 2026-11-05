@@ -42,7 +42,8 @@ repos:                            # (list) Repository configurations
       allow_rebase_merge: true
       # ...any supported GitHub repo setting
     visibility: public            # (string, optional) "public" or "private"
-    webhook:                      # (object, optional) Webhook configuration
+    use_default_webhook: true     # (bool, optional) Give this repo default_webhook; off unless set
+    webhook:                      # (object, optional) This repo's own webhook, instead of the default
       url: "http://example.com"   # (string) Webhook endpoint URL
       content_type: "json"        # (string) Payload content type
       events:                     # (list) Events that trigger the webhook
@@ -69,7 +70,7 @@ assignments:                      # (list) Team-to-repo permission assignments
     team: core-team               # (string) Team name
     permission: admin             # (string) Permission ("admin", "write", "read")
 
-default_webhook:                  # (object, optional) Default webhook for all repos
+default_webhook:                  # (object, optional) Webhook of repos with use_default_webhook
   url: "http://default.com"
   content_type: "json"
   events:
@@ -124,6 +125,12 @@ Validate your config without making any changes.
 gh-config --token <your-pat> sync config.yaml --dry-run
 # or
 GITHUB_TOKEN=<your-pat> gh-config sync config.yaml --dry-run
+```
+
+It prints every webhook it would create or update, by repo, showing the URL's host rather than the whole URL:
+
+```text
+[Dry Run] Would create webhook on gitkb/my-repo: example.com, content_type json, events ["pull_request", "push"]
 ```
 
 ---

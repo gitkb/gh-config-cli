@@ -220,6 +220,25 @@ repos:
 - Team access (`assignments`) is sent for archived repos too, so `sync` applies what `diff` shows. GitHub's docs say an archived repo's permissions are read-only; if GitHub refuses a change, `sync` stops with GitHub's message. Unarchive the repo first (`archived: false`) or change the assignment to match GitHub.
 - `diff` shows archiving and unarchiving as a change to the `archived` line. A repo archived on GitHub whose config leaves `archived` out shows `- archived: true` alone: the config doesn't record it yet (sync-from-org would add it), and `sync` leaves the repo archived.
 
+### Webhooks
+
+A repo gets a webhook only if the config says so: its own `webhook`, or `use_default_webhook: true` for the org's `default_webhook`. Being listed connects nothing, and `sync` never deletes a webhook.
+
+```yaml
+default_webhook:
+  url: https://example.com/hook
+  content_type: json
+  events: [push, pull_request]
+repos:
+  - name: on-the-feed
+    use_default_webhook: true
+  - name: not-on-the-feed
+```
+
+- `sync --dry-run` prints every webhook it would create or update, by repo, whatever `RUST_LOG` says. It shows the URL's host, not the whole URL.
+- `sync-from-org` keeps the file's `default_webhook` and sets `use_default_webhook: true` only on repos that have that webhook on GitHub, so regenerating adds no repo to it. A repo with several webhooks is recorded with the default one if it has it, otherwise its first. With no file yet, the first webhook found becomes the default.
+- A repo with both `use_default_webhook: true` and its own `webhook`, or with no `default_webhook` to use, is refused.
+
 ### Defaults and Merging
 
 You can provide a `defaults.config.yaml` file to specify org-wide or policy defaults. All fields are optional. The main config takes precedence over defaults.
@@ -246,7 +265,7 @@ default_branch_protections:
 
 **Supports:**
 - All GitHub API-manageable settings (see [GitHub REST API docs](https://docs.github.com/en/rest?apiVersion=2022-11-28))
-- Org-wide default webhooks
+- An org-wide default webhook for the repos that opt in
 - Repo settings (merge options, visibility, webhooks, etc.)
 - Teams and members
 - User roles
