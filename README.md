@@ -236,7 +236,8 @@ repos:
 ```
 
 - `sync --dry-run` prints every webhook it would create or update, by repo, whatever `RUST_LOG` says. Each line shows the URL's host, not the whole URL.
-- `sync-from-org` records what GitHub has. It keeps the file's `default_webhook` and sets `use_default_webhook: true` only on repos that have that webhook, so regenerating adds no repo to it. A config holds one webhook per repo, so a repo with several is recorded with its `webhook` from the file if it has that one, else the default, else its first. If the file has no default, the first webhook found becomes it. If a repo's webhooks can't be read, it stays as the file has it.
+- `sync-from-org` records what GitHub has. It keeps the file's `default_webhook` and sets `use_default_webhook: true` only on repos that have that webhook, so regenerating adds no repo to it. A config holds one webhook per repo, so a repo with several is recorded with its `webhook` from the file if it has that one, else the default, else its first. If the file has no default, the first webhook found becomes it. If a repo's webhooks can't be read, as with a token that can't read hooks, it stays as the file has it and the command names those repos.
+- `diff` never calls webhooks it couldn't read a match: it names those repos and exits 1.
 - A repo opted in but not yet synced has no webhook on GitHub, so regenerating clears its `use_default_webhook`. The same goes for an archived repo, which `sync` skips: run `sync` first, and don't opt in archived repos.
 - To take a repo off the default, delete its webhook on GitHub as well as the key: while the webhook exists, `diff` reports it and `sync-from-org` opts the repo back in.
 - Changing `default_webhook.url` adds a second webhook on each opted-in repo, and the old one keeps delivering until you delete it.

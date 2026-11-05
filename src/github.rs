@@ -863,7 +863,10 @@ impl GitHubClient {
             Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        let config = self.generate_unfiltered_config_from_org(file.as_ref()).await?;  // Make sure to call an unfiltered version
+        let (config, unread) = self.generate_unfiltered_config_from_org(file.as_ref()).await?;  // Make sure to call an unfiltered version
+        if !unread.is_empty() {
+            println!("Webhooks not read, so these repos keep what the file has for them: {}", unread.join(", "));
+        }
 
         // ... rest of the YAML writing logic ...
         // (Ensure this part uses the full, unfiltered config)
@@ -993,12 +996,14 @@ impl GitHubClient {
 
     /// The org as a config, reading `file` for what GitHub can't say: which default to keep and, as a config holds
     /// one webhook per repo, which of a repo's webhooks to record. Without a default, the first webhook found is it.
-    async fn generate_unfiltered_config_from_org(&self, file: Option<&Config>) -> AppResult<Config> {
+    /// Also returns the repos whose webhooks couldn't be read: their webhook is the file's, not GitHub's.
+    async fn generate_unfiltered_config_from_org(&self, file: Option<&Config>) -> AppResult<(Config, Vec<String>)> {
         let mut default_webhook = file
             .and_then(|file| file.default_webhook.clone())
             .map(|wh| WebhookConfig { events: sorted(&wh.events), ..wh });
         // This is essentially the original logic of generate_config_from_org
          let mut repos = Vec::new();
+        let mut unread = Vec::new();
         let repo_url = format!("{}/orgs/{}/repos?per_page=100", self.api_url, self.org);
         let repo_json: Vec<serde_json::Value> = self.get_all(&repo_url).await?;
 
@@ -1047,6 +1052,7 @@ impl GitHubClient {
                 }
                 Err(e) => {
                     error!("Failed to fetch webhooks for repo {}: {}. Its webhook stays as the file has it.", name, e);
+                    unread.push(name.clone());
                     in_file.map_or((false, None), |r| (r.use_default_webhook, r.webhook.clone()))
                 }
             };
@@ -1100,7 +1106,7 @@ impl GitHubClient {
             }
         }
 
-        Ok(Config {
+        let config = Config {
             org: self.org.clone(),
             repos,
             teams,
@@ -1108,7 +1114,8 @@ impl GitHubClient {
             assignments,
             default_webhook,
             default_branch_protections: vec![], // Add logic if needed
-        })
+        };
+        Ok((config, unread))
     }
 
     pub async fn sync(&mut self, config_path: &str, dry_run: bool) -> AppResult<()> {
@@ -1192,7 +1199,7 @@ impl GitHubClient {
         check_archived(&local_config)?;
 
         // --- Step 2: Fetch FULL GitHub org state (unfiltered, as sync-from-github would write) ---
-        let github_config = self.generate_unfiltered_config_from_org(Some(&local_config)).await?;
+        let (github_config, unread) = self.generate_unfiltered_config_from_org(Some(&local_config)).await?;
 
         // --- Step 3: Prepare final versions for diffing ---
         let mut diff_local_config = local_config.clone(); // Clone original local config
@@ -1262,15 +1269,19 @@ impl GitHubClient {
             }
         }
 
-        if !has_diffs {
+        if !has_diffs && unread.is_empty() {
             println!("No differences found between full GitHub org state and local config.");
-        } else {
+        } else if has_diffs {
             println!("Differences found between full GitHub org state and local config:");
             println!("--- GitHub Org (Normalized)"); // Adjusted header
             println!("+++ Local Config (Normalized)"); // Adjusted header
             print!("{}", output_buffer);
         }
-        Ok(has_diffs)
+        // Those repos match above only because their webhook came from the file: that says nothing about GitHub.
+        if !unread.is_empty() {
+            println!("Webhooks not compared, because they couldn't be read: {}", unread.join(", "));
+        }
+        Ok(has_diffs || !unread.is_empty())
     }
 }
 
@@ -1605,20 +1616,18 @@ mod tests {
         let hooks = |repo: &str| match repo {
             "first" => json!([hook("https://hooks.example/other")]),
             "off" => json!([]),
-            // Not a list, so reading its hooks fails.
-            "unreadable" => json!(null),
             "both" => json!([hook("https://hooks.example/other"), hook("https://hooks.example/h")]),
             _ => json!([hook("https://hooks.example/h")]),
         };
-        let _mocks = mock_org_with_hooks(&mut server, &[("first", false), ("off", false), ("both", false), ("on", false), ("unreadable", false)], hooks).await;
-        let config = write_file("org: o\ndefault_webhook:\n  url: https://hooks.example/h\n  content_type: json\n  events: [push, issues]\nrepos:\n- name: unreadable\n  use_default_webhook: true\n");
+        let _mocks = mock_org_with_hooks(&mut server, &[("first", false), ("off", false), ("both", false), ("on", false)], hooks).await;
+        let config = write_file("org: o\ndefault_webhook:\n  url: https://hooks.example/h\n  content_type: json\n  events: [push, issues]\n");
         let path = config.path().to_str().expect("utf-8 path");
 
         client(&server).generate_config_and_write(path, false).await.expect("generate");
         let yaml = std::fs::read_to_string(path).expect("read generated config");
         let generated = crate::config::Config::from_file_with_defaults(path, None).expect("generated config parses");
         assert_eq!(generated.default_webhook.expect("default kept").url, "https://hooks.example/h");
-        for repo in ["on", "both", "unreadable"] {
+        for repo in ["on", "both"] {
             assert!(repo_block(&yaml, repo).contains("use_default_webhook: true"), "{yaml}");
         }
         for repo in ["first", "off"] {
@@ -1658,6 +1667,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn webhooks_that_cant_be_read_stay_in_the_export_and_are_never_a_clean_diff() {
+        let mut server = mockito::Server::new_async().await;
+        // Not a list, so reading the hooks fails.
+        let _mocks = mock_org_with_hooks(&mut server, &[("r", false)], |_| json!(null)).await;
+        let file = write_file("org: o\ndefault_webhook:\n  url: https://hooks.example/h\n  content_type: json\n  events: [push]\nrepos:\n- name: r\n  use_default_webhook: true\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(repo_block(&yaml, "r").contains("use_default_webhook: true"), "{yaml}");
+        assert!(client(&server).diff(path).await.expect("diff"), "diff called webhooks it never read a match");
     }
 
     #[tokio::test]
