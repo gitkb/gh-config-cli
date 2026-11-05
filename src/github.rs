@@ -26,6 +26,11 @@ const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 /// The repo setting that archives (true) or unarchives (false) a repo.
 const ARCHIVED: &str = "archived";
 
+/// Rejects a config whose `archived` values aren't booleans, before anything reads or writes GitHub.
+fn check_archived(config: &Config) -> AppResult<()> {
+    config.repos.iter().try_for_each(|r| archived(&r.settings, &r.name).map(|_| ()))
+}
+
 /// The `archived` setting as a bool, or `None` when the settings don't name it.
 fn archived(settings: &RepoSettings, repo: &str) -> AppResult<Option<bool>> {
     settings
@@ -1101,6 +1106,7 @@ impl GitHubClient {
     pub async fn sync(&mut self, config_path: &str, dry_run: bool) -> AppResult<()> {
         let config = crate::config::Config::from_file_with_defaults(config_path, None)?;
         self.org = config.org.clone(); // Set org from config
+        check_archived(&config)?;
 
         if dry_run {
             info!("Running in dry-run mode; validating changes without applying.");
@@ -1142,8 +1148,9 @@ impl GitHubClient {
             let current = self.get_repo_settings(&repo.name).await?;
             match (archived(&current, &repo.name)? == Some(true), archived(&repo.settings, &repo.name)?) {
                 (true, Some(false)) => self.set_archived(&repo.name, false, dry_run).await?,
-                (true, _) => {
-                    info!("Skipping {}/{}: it is archived, so its settings, webhook and team access are left as they are. Set `{}: false` to unarchive it.", self.org, repo.name, ARCHIVED);
+                (true, desired) => {
+                    let hint = if desired.is_none() { format!(" Set `{ARCHIVED}: false` to unarchive it.") } else { String::new() };
+                    info!("Skipping {}/{}: it is archived, so its settings, webhook and team access are left as they are.{}", self.org, repo.name, hint);
                     stays_archived.insert(repo.name.as_str());
                     continue;
                 }
@@ -1170,9 +1177,12 @@ impl GitHubClient {
         let mut checked: HashSet<&str> = config.repos.iter().map(|r| r.name.as_str()).collect();
         for assignment in &config.assignments {
             let repo = assignment.repo.as_str();
-            if checked.insert(repo) && archived(&self.get_repo_settings(repo).await?, repo)? == Some(true) {
-                info!("Skipping team access to {}/{}: it is archived. List it under `repos` with `{}: false` to unarchive it.", self.org, repo, ARCHIVED);
-                stays_archived.insert(repo);
+            if checked.insert(repo) {
+                let current = self.get_repo_settings(repo).await?;
+                if archived(&current, repo)? == Some(true) {
+                    info!("Skipping team access to {}/{}: it is archived. List it under `repos` with `{}: false` to unarchive it.", self.org, repo, ARCHIVED);
+                    stays_archived.insert(repo);
+                }
             }
             if stays_archived.contains(repo) {
                 continue;
@@ -1199,6 +1209,7 @@ impl GitHubClient {
 
         // --- Step 1: Load original local config ---
         let local_config = crate::config::Config::from_file_with_defaults(config_path, None)?;
+        check_archived(&local_config)?;
         let local_default_webhook = local_config.default_webhook.clone();
 
         // --- Step 2: Fetch FULL GitHub org state (unfiltered, as sync-from-github would write) ---
@@ -1462,7 +1473,7 @@ mod tests {
         assert!(!client.diff(path).await.expect("diff"), "`archived: false` on an unarchived repo is a difference:\n{explicit}");
 
         std::fs::write(path, generated.replace("    archived: true\n", "")).expect("write config");
-        assert!(client.diff(path).await.expect("diff"), "an archived repo missing from the config is not shown, though sync-from-org would add it");
+        assert!(client.diff(path).await.expect("diff"), "an archived repo whose config leaves out `archived` is not shown, though sync-from-org would add it");
 
         std::fs::write(path, generated.replace("    archived: true\n", "    archived: false\n")).expect("write config");
         assert!(client.diff(path).await.expect("diff"), "an unarchive is not shown as a difference");
@@ -1525,6 +1536,12 @@ assignments:
 ",
         );
         let path = config.path().to_str().expect("utf-8 path");
+        let text = std::fs::read_to_string(path).expect("read config");
+        let bad = write_file(&text.replace("archived: false}", "archived: yes}"));
+        let bad = bad.path().to_str().expect("utf-8 path");
+        assert!(client(&server).sync(bad, false).await.is_err(), "a non-boolean `archived` was accepted");
+        assert!(client(&server).diff(bad).await.is_err(), "diff accepted a non-boolean `archived`");
+        assert!(writes.lock().expect("lock").is_empty(), "sync wrote to GitHub before rejecting the config");
         client(&server).sync(path, true).await.expect("dry run");
         assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
         client(&server).sync(path, false).await.expect("sync");
