@@ -3,6 +3,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("Config error: {0}")]
+    Config(String),
     #[error("GitHub API error: {0}")]
     GitHubApi(String),
     #[error("IO error: {0}")]

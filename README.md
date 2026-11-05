@@ -169,7 +169,14 @@ release remains available for FreeBSD, Windows arm64 and 32-bit platforms.
 
 ## Configuration
 
-gh-config uses a fully extensible, declarative YAML schema. You can specify any settings supported by the GitHub API, as well as custom fields for automation and policy.
+gh-config uses a declarative YAML schema. Repo `settings` take any GitHub repository field in gh-config's API mapping (`src/github_api_mapping_generated.rs`).
+
+Every command refuses a config with a key it doesn't know before it contacts GitHub, naming the file, where the key is and the keys allowed there:
+
+```text
+config.yaml: repos[3].settings (repo old-tool): unknown setting `archive`. Did you mean `archived`? ...
+config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `webhook`, `branch_protections`
+```
 
 **Example `config.yaml`:**
 ```yaml
@@ -180,8 +187,7 @@ repos:
       allow_merge_commit: false
       allow_squash_merge: true
       allow_rebase_merge: true
-      # Any other GitHub repo setting or custom field
-      custom_policy: "enforced"
+      # Any other GitHub repo setting in the API mapping
 teams:
   - name: core-team
     members:
@@ -209,7 +215,8 @@ repos:
 
 - `sync-from-org` writes `archived: true` for repos that are archived on GitHub, and nothing for the others.
 - `sync` unarchives a repo before changing anything else on it, and archives repos after every other change, because GitHub makes an archived repo read-only.
-- A repo that is archived on GitHub and has no `archived: false` is left alone: its settings, webhook and team access aren't changed, and `sync` logs one line saying so (shown with `RUST_LOG=info`, like its other per-change lines). Leaving `archived` out never unarchives a repo.
+- A repo that is archived on GitHub and has no `archived: false` keeps its settings and webhook: `sync` leaves them as they are and logs one line saying so (shown with `RUST_LOG=info`, like its other per-change lines). Leaving `archived` out never unarchives a repo.
+- Team access (`assignments`) is sent for archived repos too, so `sync` applies what `diff` shows. GitHub's docs say an archived repo's permissions are read-only; if GitHub refuses a change, `sync` stops with GitHub's message. Unarchive the repo first (`archived: false`) or change the assignment to match GitHub.
 - `diff` shows archiving and unarchiving as a change to the `archived` line. A repo archived on GitHub whose config leaves `archived` out shows `- archived: true` alone: the config doesn't record it yet (sync-from-org would add it), and `sync` leaves the repo archived.
 
 ### Defaults and Merging
@@ -221,7 +228,6 @@ You can provide a `defaults.config.yaml` file to specify org-wide or policy defa
 repos:
   - settings:
       allow_merge_commit: true
-      custom_policy: "default"
 default_webhook:
   url: https://discord.com/api/webhooks/...
   content_type: json
@@ -236,7 +242,6 @@ default_branch_protections:
 **Merging rules:**
 - If a setting exists in both main config and defaults, main config wins.
 - If a setting exists only in defaults, it is used unless overridden.
-- Custom fields are supported for automation/policy.
 
 **Supports:**
 - All GitHub API-manageable settings (see [GitHub REST API docs](https://docs.github.com/en/rest?apiVersion=2022-11-28))
@@ -246,7 +251,6 @@ default_branch_protections:
 - User roles
 - Team-repo permissions
 - Branch protection rules
-- Custom org-wide or policy fields for automation
 
 ---
 

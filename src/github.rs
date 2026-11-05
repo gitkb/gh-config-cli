@@ -16,7 +16,7 @@ use colored::*;
 use log::{debug, info, error};
 use reqwest::Client;
 use serde_json::json;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet}; // Added HashSet
 use similar::{ChangeTag, TextDiff};
 use std::fs::File;
@@ -320,6 +320,25 @@ impl GitHubClient {
         }
     }
 
+    /// Every item of a GitHub list, following `Link: rel="next"` from page to page.
+    async fn get_all<T: DeserializeOwned>(&self, url: &str) -> AppResult<Vec<T>> {
+        let mut items = Vec::new();
+        let mut next = Some(url.to_string());
+        while let Some(url) = next {
+            let response = self.get(&url).await?;
+            next = next_page(response.headers());
+            // The token goes only to the API itself, never to another host a `Link` header names.
+            if let Some(next) = next.as_ref().filter(|n| !n.starts_with(&format!("{}/", self.api_url))) {
+                return Err(AppError::GitHubApi(format!("Refusing next page {next} of {url}: it is outside {}", self.api_url)));
+            }
+            let text = response.text().await?;
+            let page: Vec<T> = serde_json::from_str(&text)
+                .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", url, e)))?;
+            items.extend(page);
+        }
+        Ok(items)
+    }
+
     /// Fetch all settings for a repo as a HashMap<String, serde_yaml::Value>
     async fn get_repo_settings(&self, repo_name: &str) -> AppResult<RepoSettings> {
         let full_url = format!("{}/repos/{}/{}", self.api_url, self.org, repo_name);
@@ -388,12 +407,7 @@ impl GitHubClient {
     }
 
     async fn get_team_repos(&self, team_name: &str) -> AppResult<Vec<TeamRepoResponse>> {
-        let full_url = format!("{}/orgs/{}/teams/{}/repos?per_page=100", self.api_url, self.org, team_name);
-        let response = self.get(&full_url).await?;
-        let text = response.text().await?;
-        let repos: Vec<TeamRepoResponse> = serde_json::from_str(&text)
-            .map_err(|e| AppError::GitHubApi(format!("Failed to parse team repos: {}", e)))?;
-        Ok(repos)
+        self.get_all(&format!("{}/orgs/{}/teams/{}/repos?per_page=100", self.api_url, self.org, team_name)).await
     }
 
     ///
@@ -407,12 +421,7 @@ impl GitHubClient {
     /// * `Err(AppError)` if the API call or parsing fails.
     ///
     pub async fn get_webhooks(&self, repo_name: &str) -> AppResult<Vec<WebhookResponse>> {
-        let full_url = format!("{}/repos/{}/{}/hooks", self.api_url, self.org, repo_name);
-        let response = self.get(&full_url).await?;
-        let text = response.text().await?;
-        let webhooks: Vec<WebhookResponse> = serde_json::from_str(&text)
-            .map_err(|e| AppError::GitHubApi(format!("Failed to parse webhooks: {}", e)))?;
-        Ok(webhooks)
+        self.get_all(&format!("{}/repos/{}/{}/hooks?per_page=100", self.api_url, self.org, repo_name)).await
     }
 
     async fn create_webhook(&self, repo_name: &str, webhook: &WebhookConfig) -> AppResult<()> {
@@ -626,12 +635,8 @@ impl GitHubClient {
     // Add a helper to get team members
     async fn get_team_members(&self, team_slug: &str) -> AppResult<HashSet<String>> {
         let url = format!("{}/orgs/{}/teams/{}/members?per_page=100", self.api_url, self.org, team_slug);
-        let response = self.get(&url).await?;
-        let members_json: Vec<serde_json::Value> = response.json().await.map_err(AppError::Http)?;
-        let members = members_json.iter()
-            .filter_map(|m| m["login"].as_str().map(String::from))
-            .collect::<HashSet<String>>();
-        Ok(members)
+        let members: Vec<serde_json::Value> = self.get_all(&url).await?;
+        Ok(members.iter().filter_map(|m| m["login"].as_str().map(String::from)).collect())
     }
 
     ///
@@ -982,8 +987,7 @@ impl GitHubClient {
         // This is essentially the original logic of generate_config_from_org
          let mut repos = Vec::new();
         let repo_url = format!("{}/orgs/{}/repos?per_page=100", self.api_url, self.org);
-        let repo_response = self.get(&repo_url).await?;
-        let repo_json: Vec<serde_json::Value> = repo_response.json().await.map_err(AppError::Http)?;
+        let repo_json: Vec<serde_json::Value> = self.get_all(&repo_url).await?;
 
         for repo in repo_json {
             let name = repo["name"].as_str().ok_or_else(|| AppError::GitHubApi("Missing repo name".to_string()))?.to_string();
@@ -1028,25 +1032,18 @@ impl GitHubClient {
                 visibility,
                 webhook,
                 branch_protections: vec![], // Add logic to fetch these if needed
-                extra: std::collections::HashMap::new(),
             });
         }
 
         // Fetch teams, users, assignments as before (full state needed for generation)
         let mut teams = Vec::new();
         let team_url = format!("{}/orgs/{}/teams?per_page=100", self.api_url, self.org);
-        let team_response = self.get(&team_url).await?;
-        let team_json: Vec<serde_json::Value> = team_response.json().await.map_err(AppError::Http)?;
+        let team_json: Vec<serde_json::Value> = self.get_all(&team_url).await?;
 
         for team in team_json {
             // Fetch full team data including members
              let name = team["slug"].as_str().ok_or_else(|| AppError::GitHubApi("Missing team slug".to_string()))?.to_string();
-            let members_url = format!("{}/orgs/{}/teams/{}/members?per_page=100", self.api_url, self.org, name);
-            let members_response = self.get(&members_url).await?;
-            let members_json: Vec<serde_json::Value> = members_response.json().await.map_err(AppError::Http)?;
-            let mut members = members_json.iter()
-                .filter_map(|m| m["login"].as_str().map(String::from))
-                .collect::<Vec<String>>();
+            let mut members: Vec<String> = self.get_team_members(&name).await?.into_iter().collect();
             members.sort();
 
             teams.push(Team { name, members });
@@ -1054,8 +1051,7 @@ impl GitHubClient {
 
         let mut users = Vec::new();
         let members_url = format!("{}/orgs/{}/members?per_page=100", self.api_url, self.org);
-        let members_response = self.get(&members_url).await?;
-        let members_json: Vec<serde_json::Value> = members_response.json().await.map_err(AppError::Http)?;
+        let members_json: Vec<serde_json::Value> = self.get_all(&members_url).await?;
 
         for member in members_json {
             let login = member["login"].as_str().ok_or_else(|| AppError::GitHubApi("Missing member login".to_string()))?.to_string();
@@ -1099,7 +1095,6 @@ impl GitHubClient {
             assignments,
             default_webhook,
             default_branch_protections: vec![], // Add logic if needed
-            extra: std::collections::HashMap::new(),
         })
     }
 
@@ -1132,9 +1127,8 @@ impl GitHubClient {
         }
 
         // An archived repo is read-only: unarchive before its other changes, archive after all of them,
-        // and leave a repo that stays archived alone.
+        // and leave the settings and webhook of a repo that stays archived alone.
         let mut to_archive = Vec::new();
-        let mut stays_archived = HashSet::new();
         for repo in &config.repos {
             // --- Add logging just before the failing call ---
             info!("Processing repo: {}/{}", self.org, repo.name);
@@ -1150,8 +1144,7 @@ impl GitHubClient {
                 (true, Some(false)) => self.set_archived(&repo.name, false, dry_run).await?,
                 (true, desired) => {
                     let hint = if desired.is_none() { format!(" Set `{ARCHIVED}: false` to unarchive it.") } else { String::new() };
-                    info!("Skipping {}/{}: it is archived, so its settings, webhook and team access are left as they are.{}", self.org, repo.name, hint);
-                    stays_archived.insert(repo.name.as_str());
+                    info!("Skipping {}/{}: it is archived, so its settings and webhook are left as they are.{}", self.org, repo.name, hint);
                     continue;
                 }
                 (false, Some(true)) => to_archive.push(repo.name.as_str()),
@@ -1172,21 +1165,9 @@ impl GitHubClient {
             self.add_user_to_org(user, dry_run).await?;
         }
 
-        // Assignments
-        // Team access can name repos the config doesn't list; those are checked on GitHub once each.
-        let mut checked: HashSet<&str> = config.repos.iter().map(|r| r.name.as_str()).collect();
+        // Assignments, archived repos included: GitHub decides whether their team access can change,
+        // so sync never skips a change that diff reports.
         for assignment in &config.assignments {
-            let repo = assignment.repo.as_str();
-            if checked.insert(repo) {
-                let current = self.get_repo_settings(repo).await?;
-                if archived(&current, repo)? == Some(true) {
-                    info!("Skipping team access to {}/{}: it is archived. List it under `repos` with `{}: false` to unarchive it.", self.org, repo, ARCHIVED);
-                    stays_archived.insert(repo);
-                }
-            }
-            if stays_archived.contains(repo) {
-                continue;
-            }
             info!("Processing assignment: Team '{}' on Repo '{}'", assignment.team, assignment.repo); // Add similar logging
             self.assign_team_to_repo(assignment, dry_run).await?;
         }
@@ -1348,6 +1329,17 @@ impl GitHubClient {
 }
 
 
+/// The `rel="next"` URL of GitHub's `Link` header, if there is a next page.
+fn next_page(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    link.split(',').find_map(|part| {
+        let (url, params) = part.split_once(';')?;
+        params
+            .split(';')
+            .any(|p| p.trim() == r#"rel="next""#)
+            .then(|| url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -1494,6 +1486,19 @@ mod tests {
         let config = write_file("org: o\nrepos:\n- name: r\n  webhook: {url: https://hooks.example/h, content_type: json, events: [push]}\n");
         client(&server).sync(config.path().to_str().expect("utf-8 path"), false).await.expect("sync");
         create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_next_page_on_another_host_is_refused() {
+        let mut server = mockito::Server::new_async().await;
+        let _page = server
+            .mock("GET", "/repos/o/r/hooks?per_page=100")
+            .with_header("link", r#"<https://elsewhere.example/repos/o/r/hooks?page=2>; rel="next""#)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let err = client(&server).get_webhooks("r").await.expect_err("followed a Link to another host");
+        assert!(err.to_string().contains("Refusing next page https://elsewhere.example/"), "{err}");
     }
 
     #[tokio::test]

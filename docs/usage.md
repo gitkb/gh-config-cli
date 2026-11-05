@@ -36,7 +36,7 @@ org: gitkb                # (string) Name of the GitHub organization
 
 repos:                            # (list) Repository configurations
   - name: my-repo                 # (string) Repository name
-    settings:                     # (map) Arbitrary repo settings (see below)
+    settings:                     # (map) GitHub repo settings from the API mapping (see below)
       allow_merge_commit: false   # (bool) Example setting
       allow_squash_merge: true
       allow_rebase_merge: true
@@ -53,14 +53,12 @@ repos:                            # (list) Repository configurations
         enforce_admins: true      # (bool)
         allow_deletions: false    # (bool)
         allow_force_pushes: false # (bool)
-    # extra:                      # (map, optional) Arbitrary extra fields
 
 teams:                            # (list) Team configurations
   - name: core-team               # (string) Team name
     members:                      # (list) Usernames belonging to the team
       - alice
       - bob
-    # privacy: closed             # (string, optional) Team privacy setting
 
 users:                            # (list) User configurations
   - login: alice                  # (string) GitHub username
@@ -82,15 +80,13 @@ default_branch_protections:       # (list, optional) Default branch protection r
     enforce_admins: true
     allow_deletions: false
     allow_force_pushes: false
-
-# extra:                          # (map, optional) Arbitrary extra fields for extensibility
 ```
 
 ### Notes
 
 - All fields marked as "optional" can be omitted.
-- The `settings` map under each repo supports any field present in the GitHub API (see [Extensible Schema](#extensible-schema-and-advanced-usage)).
-- Extra fields are supported at the top level and within objects for future extensibility.
+- The `settings` map under each repo takes any field in gh-config's API mapping (see [Extensible Schema](#extensible-schema-and-advanced-usage)).
+- Any other key is an error: every command refuses the config before contacting GitHub and names the file, where the key is (e.g. `repos[3].archived`) and the keys allowed there.
 
 ---
 
@@ -149,13 +145,12 @@ GITHUB_TOKEN=<your-pat> gh-config sync-from-org config.yaml --org gitkb
 gh-config supports a fully extensible configuration schema. You can declaratively manage any setting supported by the GitHub API—just add the field to your config using the correct config key.
 
 - The tool uses a mapping generated from the GitHub OpenAPI spec to translate config keys to API endpoints and payloads.
-- To add a new setting, just add the field to your config. If it's supported by the GitHub API and present in the mapping, it will be managed automatically.
+- To add a new setting, just add the field to your config. If it's present in the mapping, it will be managed automatically; if it isn't, every command refuses the config and names the setting.
 - To update the mapping, run `cargo xtask gen-api-mappings --fetch` to fetch the latest API spec and regenerate the mapping (without `--fetch` it regenerates from the pinned spec in `mappings/`).
 
 ### Troubleshooting
 
-- If a field is not applied, check that the config key matches the GitHub API field name.
-- If a field is not present in the mapping, update the mapping as described above.
+- If a setting is refused as unknown, check that the config key matches the GitHub API field name; if it does, update the mapping as described above.
 - For advanced troubleshooting, see [Architecture Overview](./architecture.md).
 
 ---

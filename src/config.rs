@@ -6,9 +6,10 @@
 use serde::{Deserialize, Serialize};
 
 use serde_yaml::Value;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 ///
 /// Configuration for a GitHub webhook.
 ///
@@ -29,6 +30,7 @@ pub struct WebhookConfig {
 pub type RepoSettings = BTreeMap<String, Value>;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 ///
 /// Branch protection rule for a repository.
 ///
@@ -61,11 +63,12 @@ impl Default for BranchProtectionRule {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 ///
 /// Repository configuration.
 ///
 /// Represents the configuration for a single repository, including its name,
-/// settings, visibility, webhook, branch protections, and any extra fields.
+/// settings, visibility, webhook and branch protections.
 ///
 pub struct Repo {
     /// Name of the repository.
@@ -78,11 +81,10 @@ pub struct Repo {
     pub webhook: Option<WebhookConfig>,
     #[serde(default)]
     pub branch_protections: Vec<BranchProtectionRule>,
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>, // For arbitrary fields/extensions
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)] // Added Clone
+#[serde(deny_unknown_fields)]
 ///
 /// Represents a team within the organization.
 ///
@@ -96,6 +98,7 @@ pub struct Team {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)] // Added Clone
+#[serde(deny_unknown_fields)]
 ///
 /// Represents a user within the organization.
 ///
@@ -109,6 +112,7 @@ pub struct User {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)] // Added Clone
+#[serde(deny_unknown_fields)]
 ///
 /// Represents a team assignment to a repository with a specific permission level.
 ///
@@ -124,6 +128,7 @@ pub struct Assignment {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 ///
 /// Top-level configuration for gh-config-cli.
 ///
@@ -151,9 +156,6 @@ pub struct Config {
     /// Default branch protection rules for all repositories (if not overridden).
     #[serde(default)]
     pub default_branch_protections: Vec<BranchProtectionRule>,
-    /// Extra fields for extensibility and custom/policy fields.
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>,
 }
 
 impl Config {
@@ -169,8 +171,20 @@ impl Config {
             }
         }
 
-        // Deserialize the merged config into Config struct
-        let config: Config = serde_yaml::from_value(main_config).map_err(crate::error::AppError::Serialization)?;
+        // Unknown or misplaced keys are refused, naming the file, where the key is and the keys allowed there.
+        let config: Config = serde_path_to_error::deserialize(main_config)
+            .map_err(|e| crate::error::AppError::Config(format!("{main_path}: {}: {}", e.path(), e.inner())))?;
+        let mapping = crate::github_api_mapping_generated::get_github_api_mapping();
+        for (i, repo) in config.repos.iter().enumerate() {
+            if let Some(key) = repo.settings.keys().find(|k| !mapping.contains_key(k.as_str())) {
+                let close: Vec<_> = mapping.keys().filter(|k| k.starts_with(key.as_str()) || key.starts_with(*k)).map(|k| format!("`{k}`")).collect();
+                let hint = if close.is_empty() { String::new() } else { format!(" Did you mean {}?", close.join(" or ")) };
+                return Err(crate::error::AppError::Config(format!(
+                    "{main_path}: repos[{i}].settings (repo {}): unknown setting `{key}`.{hint} Settings are the GitHub repository fields listed in src/github_api_mapping_generated.rs, such as `allow_merge_commit` and `archived`.",
+                    repo.name
+                )));
+            }
+        }
         Ok(config)
     }
 }
@@ -260,9 +274,8 @@ repos:
     settings:
       allow_merge_commit: false
       allow_squash_merge: true
-      custom_default: 42
-    custom_policy: "default"
-extra_default: "foo"
+      allow_auto_merge: true
+    visibility: public
 "#;
         let main_yaml = r#"
 org: test-org
@@ -271,7 +284,7 @@ repos:
     settings:
       allow_merge_commit: true
       allow_rebase_merge: true
-    custom_policy: "main"
+    visibility: private
 "#;
         let mut defaults_file = tempfile::NamedTempFile::new().expect("create temp file");
         write!(defaults_file, "{}", defaults_yaml).expect("write defaults yaml");
@@ -289,12 +302,10 @@ repos:
         assert_eq!(repo.settings.get("allow_merge_commit").unwrap().as_bool().unwrap(), true);
         assert_eq!(repo.settings.get("allow_squash_merge").unwrap().as_bool().unwrap(), true);
         assert_eq!(repo.settings.get("allow_rebase_merge").unwrap().as_bool().unwrap(), true);
-        // Custom default is filled in
-        assert_eq!(repo.settings.get("custom_default").unwrap().as_i64().unwrap(), 42);
-        // Custom policy: main config wins
-        assert_eq!(repo.extra.get("custom_policy").unwrap().as_str().unwrap(), "main");
-        // Top-level extra field from defaults
-        assert_eq!(config.extra.get("extra_default").unwrap().as_str().unwrap(), "foo");
+        // A default is filled in
+        assert!(repo.settings.get("allow_auto_merge").unwrap().as_bool().unwrap());
+        // Main config wins
+        assert_eq!(repo.visibility.as_deref(), Some("private"));
     }
 
     #[test]
@@ -357,14 +368,14 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn unknown_or_misplaced_keys_are_refused_naming_file_key_and_allowed_keys() {
-        for (yaml, key, allowed) in [
+    fn unknown_or_misplaced_keys_are_refused_naming_file_place_key_and_allowed_keys() {
+        for (yaml, place, key, allowed) in [
             // A typo under settings.
-            ("org: o\nrepos:\n- name: r\n  settings:\n    archive: true\n", "`archive`", "`archived`"),
+            ("org: o\nrepos:\n- name: r\n  settings:\n    archive: true\n", "repos[0].settings", "`archive`", "`archived`"),
             // `archived` belongs under settings, not on the repo.
-            ("org: o\nrepos:\n- name: r\n  archived: true\n", "`archived`", "`settings`"),
-            ("org: o\nteam: []\n", "`team`", "`teams`"),
-            ("org: o\nusers:\n- login: a\n  role: admin\n  rol: member\n", "`rol`", "`role`"),
+            ("org: o\nrepos:\n- name: r\n  archived: true\n", "repos[0].archived", "`archived`", "`settings`"),
+            ("org: o\nteam: []\n", "team", "`team`", "`teams`"),
+            ("org: o\nusers:\n- login: a\n  role: admin\n  rol: member\n", "users[0].rol", "`rol`", "`role`"),
         ] {
             let mut file = tempfile::NamedTempFile::new().expect("create temp file");
             write!(file, "{}", yaml).expect("write yaml");
@@ -372,7 +383,7 @@ mod tests {
             let err = crate::config::Config::from_file_with_defaults(path, None)
                 .expect_err(&format!("accepted {key} in:\n{yaml}"))
                 .to_string();
-            for part in [path, key, allowed] {
+            for part in [path, place, key, allowed] {
                 assert!(err.contains(part), "error for {key} doesn't name {part}: {err}");
             }
         }
