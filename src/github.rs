@@ -64,6 +64,21 @@ struct PermissionDetails {
     pull: bool,
     push: bool,
     admin: bool,
+    // Finer levels GitHub reports alongside the three above.
+    #[serde(default)]
+    triage: bool,
+    #[serde(default)]
+    maintain: bool,
+}
+
+impl PermissionDetails {
+    /// The highest level granted, in the config's names (`pull`, `triage`, `push`, `maintain`, `admin`).
+    fn level(&self) -> &'static str {
+        [(self.admin, "admin"), (self.maintain, "maintain"), (self.push, "push"), (self.triage, "triage"), (self.pull, "pull")]
+            .into_iter()
+            .find_map(|(granted, name)| granted.then_some(name))
+            .unwrap_or("none")
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -264,6 +279,11 @@ impl GitHubClient {
     }
 
     async fn get(&self, url: &str) -> AppResult<reqwest::Response> {
+        self.get_as(url, "application/vnd.github+json").await
+    }
+
+    /// A GET that asks for the `accept` media type.
+    async fn get_as(&self, url: &str, accept: &str) -> AppResult<reqwest::Response> {
         // --- Add Enhanced Logging ---
         debug!("Attempting to build GET request for URL: '{}'", url);
         if url.trim().is_empty() {
@@ -299,7 +319,7 @@ impl GitHubClient {
         // Chain the rest - if it fails here, it's likely header related
         let request_builder = builder_result
             .header(reqwest::header::AUTHORIZATION, auth_header_value) // Use constant for clarity
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::ACCEPT, accept)
             .header(reqwest::header::USER_AGENT, "gh-config");
 
         // --- Log before send ---
@@ -821,25 +841,16 @@ impl GitHubClient {
             "{}/orgs/{}/teams/{}/repos/{}/{}",
             self.api_url, self.org, team, self.org, repo
         );
-        match self.get(&full_url).await {
+        // Without this media type GitHub answers a bare 204, which says nothing about the level.
+        match self.get_as(&full_url, "application/vnd.github.v3.repository+json").await {
             Ok(response) => {
                 let text = response.text().await?;
                 if text.is_empty() {
-                    debug!("Empty response body from GET {}, assuming permission exists but not detailed", full_url);
-                    return Ok(Some("push".to_string()));
+                    return Err(AppError::GitHubApi(format!("GET {} returned an empty body instead of the team's permissions", full_url)));
                 }
                 let perms: TeamRepoResponse = serde_json::from_str(&text)
                     .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", full_url, e)))?;
-                let permission = if perms.permissions.admin {
-                    "admin"
-                } else if perms.permissions.push {
-                    "push"
-                } else if perms.permissions.pull {
-                    "pull"
-                } else {
-                    "none"
-                };
-                Ok(Some(permission.to_string()))
+                Ok(Some(perms.permissions.level().to_string()))
             }
             Err(AppError::GitHubApi(e)) if e.contains("404") => Ok(None),
             Err(e) => Err(e),
@@ -1064,15 +1075,7 @@ impl GitHubClient {
         for team in &teams {
             let team_repos = self.get_team_repos(&team.name).await?;
             for repo in team_repos {
-                 let permission = if repo.permissions.admin {
-                    "admin"
-                } else if repo.permissions.push {
-                    "push" // Use push/pull
-                } else if repo.permissions.pull {
-                    "pull"
-                } else {
-                    "none"
-                };
+                let permission = repo.permissions.level();
                 if permission != "none" {
                     assignments.push(Assignment {
                         repo: repo.name.clone(),
@@ -1499,6 +1502,36 @@ mod tests {
             .await;
         let err = client(&server).get_webhooks("r").await.expect_err("followed a Link to another host");
         assert!(err.to_string().contains("Refusing next page https://elsewhere.example/"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn team_permission_is_read_from_the_repository_media_type_never_guessed() {
+        let mut server = mockito::Server::new_async().await;
+        let check = |repo: &str| format!("/orgs/o/teams/devs/repos/o/{repo}");
+        let repository = "application/vnd.github.v3.repository+json";
+        let perms = |p: &str| format!(r#"{{"name":"x","role_name":"x","permissions":{p}}}"#);
+        let mut mocks = Vec::new();
+        for (repo, body) in [
+            ("read", Some(perms(r#"{"admin":false,"maintain":false,"push":false,"triage":false,"pull":true}"#))),
+            ("maintained", Some(perms(r#"{"admin":false,"maintain":true,"push":true,"triage":true,"pull":true}"#))),
+            ("triaged", Some(perms(r#"{"admin":false,"maintain":false,"push":false,"triage":true,"pull":true}"#))),
+            ("empty", None),
+        ] {
+            // Like GitHub: without the repository media type the check is a bare 204.
+            mocks.push(server.mock("GET", check(repo).as_str()).match_header("accept", "application/vnd.github+json").with_status(204).create_async().await);
+            let with_type = server.mock("GET", check(repo).as_str()).match_header("accept", repository);
+            mocks.push(match body {
+                Some(body) => with_type.with_body(body),
+                None => with_type.with_status(204),
+            }.create_async().await);
+        }
+        let client = client(&server);
+        for (repo, want) in [("read", "pull"), ("maintained", "maintain"), ("triaged", "triage")] {
+            let got = client.get_team_repo_permission("devs", repo).await.expect("permission");
+            assert_eq!(got.as_deref(), Some(want), "team permission on {repo}");
+        }
+        let err = client.get_team_repo_permission("devs", "empty").await.expect_err("guessed a permission from an empty body");
+        assert!(err.to_string().contains("empty"), "{err}");
     }
 
     #[tokio::test]
