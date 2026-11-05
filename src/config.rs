@@ -174,16 +174,24 @@ impl Config {
         // Unknown or misplaced keys are refused, naming the file, where the key is and the keys allowed there.
         let config: Config = serde_path_to_error::deserialize(main_config)
             .map_err(|e| crate::error::AppError::Config(format!("{main_path}: {}: {}", e.path(), e.inner())))?;
-        let mapping = crate::github_api_mapping_generated::get_github_api_mapping();
+        let allowed = crate::api_mapping::repo_settings();
+        let all = crate::github_api_mapping_generated::get_github_api_mapping();
         for (i, repo) in config.repos.iter().enumerate() {
-            if let Some(key) = repo.settings.keys().find(|k| !mapping.contains_key(k.as_str())) {
-                let close: Vec<_> = mapping.keys().filter(|k| k.starts_with(key.as_str()) || key.starts_with(*k)).map(|k| format!("`{k}`")).collect();
-                let hint = if close.is_empty() { String::new() } else { format!(" Did you mean {}?", close.join(" or ")) };
-                return Err(crate::error::AppError::Config(format!(
-                    "{main_path}: repos[{i}].settings (repo {}): unknown setting `{key}`.{hint} Settings are the GitHub repository fields listed in src/github_api_mapping_generated.rs, such as `allow_merge_commit` and `archived`.",
-                    repo.name
-                )));
-            }
+            let Some(key) = repo.settings.keys().find(|k| !allowed.contains_key(k.as_str())) else { continue };
+            let problem = match all.get(key.as_str()) {
+                Some(m) => format!("`{key}` is not a repository setting: it would be sent to {} {}, which is not the repo.", m.method, m.endpoint),
+                None => {
+                    let mut close: Vec<_> = allowed.keys().filter(|k| !key.is_empty() && (k.starts_with(key.as_str()) || key.starts_with(**k))).collect();
+                    close.sort();
+                    let hint: Vec<_> = close.iter().take(5).map(|k| format!("`{k}`")).collect();
+                    let hint = if hint.is_empty() { String::new() } else { format!(" Did you mean {}?", hint.join(" or ")) };
+                    format!("unknown setting `{key}`.{hint}")
+                }
+            };
+            return Err(crate::error::AppError::Config(format!(
+                "{main_path}: repos[{i}].settings (repo {}): {problem} A repo's settings are fields of GitHub's repository endpoints, such as `allow_merge_commit` and `archived`.",
+                repo.name
+            )));
         }
         Ok(config)
     }

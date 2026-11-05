@@ -85,7 +85,7 @@ default_branch_protections:       # (list, optional) Default branch protection r
 ### Notes
 
 - All fields marked as "optional" can be omitted.
-- The `settings` map under each repo takes any field in gh-config's API mapping (see [Extensible Schema](#extensible-schema-and-advanced-usage)).
+- The `settings` map under each repo takes the repository fields in gh-config's API mapping (see [Extensible Schema](#extensible-schema-and-advanced-usage)).
 - Any other key is an error: every command refuses the config before contacting GitHub and names the file, where the key is (e.g. `repos[3].archived`) and the keys allowed there.
 
 ---
@@ -142,7 +142,7 @@ GITHUB_TOKEN=<your-pat> gh-config sync-from-org config.yaml --org gitkb
 
 ## Extensible Schema and Advanced Usage
 
-gh-config supports a fully extensible configuration schema. You can declaratively manage any setting supported by the GitHub API—just add the field to your config using the correct config key.
+A repo's `settings` take any field of GitHub's repository endpoints that is in gh-config's API mapping: an endpoint under `/repos/{owner}/{repo}` that needs nothing but the repo's name. A key that would write the org, a user or anything else is refused.
 
 - The tool uses a mapping generated from the GitHub OpenAPI spec to translate config keys to API endpoints and payloads.
 - To add a new setting, just add the field to your config. If it's present in the mapping, it will be managed automatically; if it isn't, every command refuses the config and names the setting.

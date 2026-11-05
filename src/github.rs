@@ -10,7 +10,6 @@
 */
 
 use crate::config::{Assignment, Repo, RepoSettings, Team, User, WebhookConfig, Config};
-use crate::github_api_mapping_generated::get_github_api_mapping;
 use crate::error::{AppError, AppResult};
 use colored::*;
 use log::{debug, info, error};
@@ -73,11 +72,11 @@ struct PermissionDetails {
 
 impl PermissionDetails {
     /// The highest level granted, in the config's names (`pull`, `triage`, `push`, `maintain`, `admin`).
-    fn level(&self) -> &'static str {
+    /// `None` when no level is granted.
+    fn level(&self) -> Option<&'static str> {
         [(self.admin, "admin"), (self.maintain, "maintain"), (self.push, "push"), (self.triage, "triage"), (self.pull, "pull")]
             .into_iter()
             .find_map(|(granted, name)| granted.then_some(name))
-            .unwrap_or("none")
     }
 }
 
@@ -346,11 +345,21 @@ impl GitHubClient {
         let mut next = Some(url.to_string());
         while let Some(url) = next {
             let response = self.get(&url).await?;
-            next = next_page(response.headers());
-            // The token goes only to the API itself, never to another host a `Link` header names.
-            if let Some(next) = next.as_ref().filter(|n| !n.starts_with(&format!("{}/", self.api_url))) {
-                return Err(AppError::GitHubApi(format!("Refusing next page {next} of {url}: it is outside {}", self.api_url)));
-            }
+            next = match next_page(response.headers()) {
+                None => None,
+                Some(target) => {
+                    // A relative target (RFC 8288) resolves against this page's URL.
+                    let next = reqwest::Url::parse(&url)
+                        .and_then(|base| base.join(&target))
+                        .map_err(|e| AppError::GitHubApi(format!("Bad next page {target} of {url}: {e}")))?
+                        .to_string();
+                    // The token goes only to the API itself, never to another host a `Link` header names.
+                    if !next.starts_with(&format!("{}/", self.api_url)) {
+                        return Err(AppError::GitHubApi(format!("Refusing next page {next} of {url}: it is outside {}", self.api_url)));
+                    }
+                    Some(next)
+                }
+            };
             let text = response.text().await?;
             let page: Vec<T> = serde_json::from_str(&text)
                 .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", url, e)))?;
@@ -542,7 +551,7 @@ impl GitHubClient {
     /// `archived` is skipped here: `sync` unarchives before and archives after everything else.
     pub async fn update_repo_settings(&self, repo: &Repo, current: &RepoSettings, dry_run: bool) -> AppResult<()> {
         let desired = &repo.settings;
-        let mapping = get_github_api_mapping();
+        let mapping = crate::api_mapping::repo_settings();
 
         // --- Optimization suggestion (Apply after fixing URL): ---
         // Instead of sending one PATCH per setting, collect all PATCHes for the same endpoint.
@@ -850,7 +859,7 @@ impl GitHubClient {
                 }
                 let perms: TeamRepoResponse = serde_json::from_str(&text)
                     .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", full_url, e)))?;
-                Ok(Some(perms.permissions.level().to_string()))
+                Ok(perms.permissions.level().map(String::from))
             }
             Err(AppError::GitHubApi(e)) if e.contains("404") => Ok(None),
             Err(e) => Err(e),
@@ -1075,8 +1084,7 @@ impl GitHubClient {
         for team in &teams {
             let team_repos = self.get_team_repos(&team.name).await?;
             for repo in team_repos {
-                let permission = repo.permissions.level();
-                if permission != "none" {
+                if let Some(permission) = repo.permissions.level() {
                     assignments.push(Assignment {
                         repo: repo.name.clone(),
                         team: team.name.clone(),
@@ -1479,7 +1487,8 @@ mod tests {
             server.mock("GET", "/repos/o/r").with_body(r#"{"name":"r","archived":false}"#).create_async().await,
             server
                 .mock("GET", mockito::Matcher::Regex(r"^/repos/o/r/hooks(\?per_page=100)?$".into()))
-                .with_header("link", &format!(r#"<{}{page2}>; rel="next""#, server.url()))
+                // A relative target (RFC 8288) resolves against the request URL; mock_org covers absolute ones.
+                .with_header("link", &format!(r#"<{page2}>; rel="next""#))
                 .with_body(hook(1, "https://other.example/x"))
                 .create_async()
                 .await,
@@ -1489,6 +1498,35 @@ mod tests {
         let config = write_file("org: o\nrepos:\n- name: r\n  webhook: {url: https://hooks.example/h, content_type: json, events: [push]}\n");
         client(&server).sync(config.path().to_str().expect("utf-8 path"), false).await.expect("sync");
         create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn settings_that_write_outside_the_repo_are_refused_before_any_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mut any = Vec::new();
+        for method in ["GET", "POST", "PATCH", "PUT", "DELETE"] {
+            any.push(server.mock(method, mockito::Matcher::Any).expect(0).create_async().await);
+        }
+        for (key, writes) in [
+            ("armored_public_key", "POST /user/gpg_keys"),
+            ("default_repository_permission", "PATCH /orgs/{org}"),
+            ("actions", "PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}"),
+        ] {
+            let config = write_file(&format!(
+                "org: o\ndefault_webhook: {{url: https://h.example/x, content_type: json, events: [push]}}\nrepos:\n- name: r\n  settings:\n    {key}: x\n"
+            ));
+            let path = config.path().to_str().expect("utf-8 path");
+            for dry_run in [true, false] {
+                let err = client(&server).sync(path, dry_run).await.expect_err(&format!("accepted `{key}` under a repo's settings"));
+                let err = err.to_string();
+                for part in [path, "repos[0].settings", key, writes] {
+                    assert!(err.contains(part), "error for {key} doesn't name {part}: {err}");
+                }
+            }
+        }
+        for mock in any {
+            mock.assert_async().await;
+        }
     }
 
     #[tokio::test]

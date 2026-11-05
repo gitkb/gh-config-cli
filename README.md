@@ -169,12 +169,13 @@ release remains available for FreeBSD, Windows arm64 and 32-bit platforms.
 
 ## Configuration
 
-gh-config uses a declarative YAML schema. Repo `settings` take any GitHub repository field in gh-config's API mapping (`src/github_api_mapping_generated.rs`).
+gh-config uses a declarative YAML schema. Repo `settings` take the fields of GitHub's repository endpoints in gh-config's API mapping (`src/github_api_mapping_generated.rs`): endpoints under `/repos/{owner}/{repo}` that need nothing but the repo's name. A key the mapping sends to the org or a user is refused, so a misplaced key can't change either.
 
 Every command refuses a config with a key it doesn't know before it contacts GitHub, naming the file, where the key is and the keys allowed there:
 
 ```text
 config.yaml: repos[3].settings (repo old-tool): unknown setting `archive`. Did you mean `archived`? ...
+config.yaml: repos[3].settings (repo old-tool): `default_repository_permission` is not a repository setting: it would be sent to PATCH /orgs/{org}, which is not the repo. ...
 config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `webhook`, `branch_protections`
 ```
 
