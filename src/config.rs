@@ -357,6 +357,28 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn unknown_or_misplaced_keys_are_refused_naming_file_key_and_allowed_keys() {
+        for (yaml, key, allowed) in [
+            // A typo under settings.
+            ("org: o\nrepos:\n- name: r\n  settings:\n    archive: true\n", "`archive`", "`archived`"),
+            // `archived` belongs under settings, not on the repo.
+            ("org: o\nrepos:\n- name: r\n  archived: true\n", "`archived`", "`settings`"),
+            ("org: o\nteam: []\n", "`team`", "`teams`"),
+            ("org: o\nusers:\n- login: a\n  role: admin\n  rol: member\n", "`rol`", "`role`"),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+            write!(file, "{}", yaml).expect("write yaml");
+            let path = file.path().to_str().expect("utf-8 path");
+            let err = crate::config::Config::from_file_with_defaults(path, None)
+                .expect_err(&format!("accepted {key} in:\n{yaml}"))
+                .to_string();
+            for part in [path, key, allowed] {
+                assert!(err.contains(part), "error for {key} doesn't name {part}: {err}");
+            }
+        }
+    }
+
+    #[test]
     fn test_from_file_deserializes_valid_yaml() {
         // Sample YAML content matching Config structure
         let yaml = r#"

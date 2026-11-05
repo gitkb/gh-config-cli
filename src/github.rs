@@ -1408,19 +1408,24 @@ mod tests {
     }
 
     /// Mocks the GET side of org `o`: each `(name, archived)` repo with one shared webhook, no teams, no members.
+    /// Like GitHub, the repo list comes in pages linked by `Link: rel="next"`, here one repo per page.
     async fn mock_org(server: &mut mockito::ServerGuard, repos: &[(&str, bool)]) -> Vec<mockito::Mock> {
-        let list: Vec<_> = repos.iter().map(|(name, _)| json!({"name": name, "private": false})).collect();
         let mut mocks = vec![
-            server.mock("GET", "/orgs/o/repos?per_page=100").with_body(json!(list).to_string()).create_async().await,
             server.mock("GET", "/orgs/o/teams?per_page=100").with_body("[]").create_async().await,
             server.mock("GET", "/orgs/o/members?per_page=100").with_body("[]").create_async().await,
         ];
+        let page = |n: usize| if n == 1 { "/orgs/o/repos?per_page=100".to_string() } else { format!("/orgs/o/repos?per_page=100&page={n}") };
         let hooks = json!([{"id": 1, "url": "u", "config": {"url": "https://hooks.example/h", "content_type": "json"}, "events": ["push"]}]);
-        for (name, archived) in repos {
+        for (i, (name, archived)) in repos.iter().enumerate() {
+            let mut list = server.mock("GET", page(i + 1).as_str()).with_body(json!([{"name": name, "private": false}]).to_string());
+            if i + 1 < repos.len() {
+                list = list.with_header("link", &format!(r#"<{0}{1}>; rel="next", <{0}{2}>; rel="last""#, server.url(), page(i + 2), page(repos.len())));
+            }
+            mocks.push(list.create_async().await);
             let repo = json!({"name": name, "private": false, "archived": archived,
                 "allow_merge_commit": false, "allow_squash_merge": true, "allow_rebase_merge": true});
             mocks.push(server.mock("GET", format!("/repos/o/{name}").as_str()).with_body(repo.to_string()).create_async().await);
-            mocks.push(server.mock("GET", format!("/repos/o/{name}/hooks").as_str()).with_body(hooks.to_string()).create_async().await);
+            mocks.push(server.mock("GET", format!("/repos/o/{name}/hooks?per_page=100").as_str()).with_body(hooks.to_string()).create_async().await);
         }
         mocks
     }
@@ -1457,6 +1462,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_from_org_reads_every_page_of_repos() {
+        let mut server = mockito::Server::new_async().await;
+        let names = ["a", "b", "c"];
+        let _mocks = mock_org(&mut server, &names.map(|n| (n, false))).await;
+        let out = write_file("");
+        let path = out.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("sync-from-org");
+        let yaml = std::fs::read_to_string(path).expect("read output");
+        for name in names {
+            assert!(yaml.contains(&format!("- name: {name}\n")), "repo {name} on a later page is missing:\n{yaml}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_finds_its_webhook_on_a_later_page_instead_of_adding_a_duplicate() {
+        let mut server = mockito::Server::new_async().await;
+        let hook = |id: i64, url: &str| json!([{"id": id, "url": "u", "config": {"url": url, "content_type": "json"}, "events": ["push"]}]).to_string();
+        let page2 = "/repos/o/r/hooks?per_page=100&page=2";
+        let _mocks = [
+            server.mock("GET", "/repos/o/r").with_body(r#"{"name":"r","archived":false}"#).create_async().await,
+            server
+                .mock("GET", mockito::Matcher::Regex(r"^/repos/o/r/hooks(\?per_page=100)?$".into()))
+                .with_header("link", &format!(r#"<{}{page2}>; rel="next""#, server.url()))
+                .with_body(hook(1, "https://other.example/x"))
+                .create_async()
+                .await,
+            server.mock("GET", page2).with_body(hook(31, "https://hooks.example/h")).create_async().await,
+        ];
+        let create = server.mock("POST", "/repos/o/r/hooks").expect(0).create_async().await;
+        let config = write_file("org: o\nrepos:\n- name: r\n  webhook: {url: https://hooks.example/h, content_type: json, events: [push]}\n");
+        client(&server).sync(config.path().to_str().expect("utf-8 path"), false).await.expect("sync");
+        create.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn diff_round_trips_archived() {
         let mut server = mockito::Server::new_async().await;
         let _mocks = mock_org(&mut server, &[("live", false), ("old", true)]).await;
@@ -1483,7 +1523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_unarchives_first_archives_last_and_leaves_archived_repos_alone() {
+    async fn sync_unarchives_first_archives_last_and_leaves_archived_repo_settings_alone() {
         let mut server = mockito::Server::new_async().await;
         // kept stays archived, going gets archived, back gets unarchived; hidden is archived and only has team access.
         let _mocks = mock_org(&mut server, &[("kept", true), ("going", false), ("back", true), ("hidden", true)]).await;
@@ -1493,6 +1533,8 @@ mod tests {
             ("PATCH", "/repos/o/going"),
             ("PATCH", "/repos/o/back"),
             ("PUT", "/orgs/o/teams/devs/repos/o/going"),
+            ("PUT", "/orgs/o/teams/devs/repos/o/kept"),
+            ("PUT", "/orgs/o/teams/devs/repos/o/hidden"),
         ] {
             let writes = writes.clone();
             let label = format!("{method} {path}");
@@ -1508,13 +1550,18 @@ mod tests {
                     .await,
             );
         }
-        // Nothing else is mocked: any write to `kept` gets mockito's 501 and fails the sync.
-        let _no_access = server
-            .mock("GET", "/orgs/o/teams/devs/repos/o/going")
-            .with_status(404)
-            .with_body(r#"{"message":"Not Found","status":"404"}"#)
-            .create_async()
-            .await;
+        // Nothing else is mocked: any settings or webhook write to `kept` gets mockito's 501 and fails the sync.
+        let mut no_access = Vec::new();
+        for repo in ["going", "kept", "hidden"] {
+            no_access.push(
+                server
+                    .mock("GET", format!("/orgs/o/teams/devs/repos/o/{repo}").as_str())
+                    .with_status(404)
+                    .with_body(r#"{"message":"Not Found","status":"404"}"#)
+                    .create_async()
+                    .await,
+            );
+        }
         let config = write_file(
             "org: o
 default_webhook:
@@ -1552,6 +1599,9 @@ assignments:
                 r#"PATCH /repos/o/back {"archived":false}"#,
                 r#"PATCH /repos/o/back {"allow_merge_commit":true}"#,
                 r#"PUT /orgs/o/teams/devs/repos/o/going {"permission":"push"}"#,
+                // Team access isn't skipped on archived repos: GitHub decides, so sync and diff agree.
+                r#"PUT /orgs/o/teams/devs/repos/o/kept {"permission":"push"}"#,
+                r#"PUT /orgs/o/teams/devs/repos/o/hidden {"permission":"push"}"#,
                 r#"PATCH /repos/o/going {"archived":true}"#,
             ]
         );
