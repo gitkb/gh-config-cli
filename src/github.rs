@@ -994,7 +994,7 @@ impl GitHubClient {
                          }
                     }
                     // Only archived repos get the key; like any default, `archived: false` isn't written.
-                    if archived(&full_settings, &name)? == Some(true) {
+                    if full_settings.get(ARCHIVED) == Some(&serde_yaml::Value::Bool(true)) {
                         manageable_settings.insert(ARCHIVED.to_string(), serde_yaml::Value::Bool(true));
                     }
                      manageable_settings
@@ -1198,10 +1198,17 @@ impl GitHubClient {
         let mut diff_local_config = local_config.clone(); // Clone original local config
         let mut diff_github_config = github_config;      // Use the fetched FULL GitHub org state
 
-        // GitHub's side leaves out `archived: false`; where the local config names it, show the real value.
-        for local in diff_local_config.repos.iter().filter(|r| r.settings.contains_key(ARCHIVED)) {
-            if let Some(remote) = diff_github_config.repos.iter_mut().find(|r| r.name == local.name) {
-                remote.settings.entry(ARCHIVED.to_string()).or_insert(serde_yaml::Value::Bool(false));
+        // Show `archived` the way sync treats it: a repo whose local config leaves it out keeps its state,
+        // so it's no difference; where the config names it, compare against GitHub's real value (false included).
+        for remote in &mut diff_github_config.repos {
+            match diff_local_config.repos.iter().find(|r| r.name == remote.name) {
+                Some(local) if local.settings.contains_key(ARCHIVED) => {
+                    remote.settings.entry(ARCHIVED.to_string()).or_insert(serde_yaml::Value::Bool(false));
+                }
+                Some(_) => {
+                    remote.settings.remove(ARCHIVED);
+                }
+                None => {}
             }
         }
 
@@ -1449,8 +1456,14 @@ mod tests {
         std::fs::write(path, &explicit).expect("write config");
         assert!(!client.diff(path).await.expect("diff"), "`archived: false` on an unarchived repo is a difference:\n{explicit}");
 
+        std::fs::write(path, generated.replace("    archived: true\n", "")).expect("write config");
+        assert!(!client.diff(path).await.expect("diff"), "leaving out `archived` (which sync leaves alone) is a difference");
+
         std::fs::write(path, generated.replace("    archived: true\n", "    archived: false\n")).expect("write config");
         assert!(client.diff(path).await.expect("diff"), "an unarchive is not shown as a difference");
+
+        std::fs::write(path, explicit.replace("    archived: false\n", "    archived: true\n")).expect("write config");
+        assert!(client.diff(path).await.expect("diff"), "an archive is not shown as a difference");
     }
 
     #[tokio::test]
@@ -1480,6 +1493,12 @@ mod tests {
             );
         }
         // Nothing else is mocked: any write to `kept` gets mockito's 501 and fails the sync.
+        let _no_access = server
+            .mock("GET", "/orgs/o/teams/devs/repos/o/going")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found","status":"404"}"#)
+            .create_async()
+            .await;
         let config = write_file(
             "org: o
 default_webhook:
@@ -1499,10 +1518,10 @@ assignments:
 - {repo: kept, team: devs, permission: push}
 ",
         );
-        client(&server)
-            .sync(config.path().to_str().expect("utf-8 path"), false)
-            .await
-            .expect("sync");
+        let path = config.path().to_str().expect("utf-8 path");
+        client(&server).sync(path, true).await.expect("dry run");
+        assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
+        client(&server).sync(path, false).await.expect("sync");
         assert_eq!(
             *writes.lock().expect("lock"),
             [
