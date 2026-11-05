@@ -204,9 +204,7 @@ impl Config {
         }
         Ok(config)
     }
-}
 
-impl Config {
     /// Gives each repo the webhook it ends up with, events sorted, and drops the default: nothing after this needs it.
     pub fn resolve_webhooks(&mut self) {
         let default = self.default_webhook.take();

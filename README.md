@@ -176,7 +176,7 @@ Every command refuses a config with a key it doesn't know before it contacts Git
 ```text
 config.yaml: repos[3].settings (repo old-tool): unknown setting `archive`. Did you mean `archived`? ...
 config.yaml: repos[3].settings (repo old-tool): `default_repository_permission` is not a repository setting: it would be sent to PATCH /orgs/{org}, which is not the repo. ...
-config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `webhook`, `branch_protections`
+config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `use_default_webhook`, `webhook`, `branch_protections`
 ```
 
 **Example `config.yaml`:**
@@ -235,9 +235,14 @@ repos:
   - name: not-on-the-feed
 ```
 
-- `sync --dry-run` prints every webhook it would create or update, by repo, whatever `RUST_LOG` says. It shows the URL's host, not the whole URL.
-- `sync-from-org` keeps the file's `default_webhook` and sets `use_default_webhook: true` only on repos that have that webhook on GitHub, so regenerating adds no repo to it. A repo with several webhooks is recorded with the default one if it has it, otherwise its first. With no file yet, the first webhook found becomes the default.
+- `sync --dry-run` prints every webhook it would create or update, by repo, whatever `RUST_LOG` says. Each line shows the URL's host, not the whole URL.
+- `sync-from-org` records what GitHub has. It keeps the file's `default_webhook` and sets `use_default_webhook: true` only on repos that have that webhook, so regenerating adds no repo to it. A config holds one webhook per repo, so a repo with several is recorded with its `webhook` from the file if it has that one, else the default, else its first. If the file has no default, the first webhook found becomes it. If a repo's webhooks can't be read, it stays as the file has it.
+- A repo opted in but not yet synced has no webhook on GitHub, so regenerating clears its `use_default_webhook`. The same goes for an archived repo, which `sync` skips: run `sync` first, and don't opt in archived repos.
+- To take a repo off the default, delete its webhook on GitHub as well as the key: while the webhook exists, `diff` reports it and `sync-from-org` opts the repo back in.
+- Changing `default_webhook.url` adds a second webhook on each opted-in repo, and the old one keeps delivering until you delete it.
 - A repo with both `use_default_webhook: true` and its own `webhook`, or with no `default_webhook` to use, is refused.
+
+**Upgrading from 1.3.0:** a config with `default_webhook` and no `use_default_webhook` keeps working but connects nothing new. Add the key to each repo that should have the default, or run `sync-from-org` to mark the repos that already have it. That marks every repo holding the webhook, so delete any that shouldn't have it first.
 
 ### Defaults and Merging
 

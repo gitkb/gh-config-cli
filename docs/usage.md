@@ -42,8 +42,7 @@ repos:                            # (list) Repository configurations
       allow_rebase_merge: true
       # ...any supported GitHub repo setting
     visibility: public            # (string, optional) "public" or "private"
-    use_default_webhook: true     # (bool, optional) Give this repo default_webhook; off unless set
-    webhook:                      # (object, optional) This repo's own webhook, instead of the default
+    webhook:                      # (object, optional) This repo's own webhook
       url: "http://example.com"   # (string) Webhook endpoint URL
       content_type: "json"        # (string) Payload content type
       events:                     # (list) Events that trigger the webhook
@@ -54,6 +53,8 @@ repos:                            # (list) Repository configurations
         enforce_admins: true      # (bool)
         allow_deletions: false    # (bool)
         allow_force_pushes: false # (bool)
+  - name: other-repo
+    use_default_webhook: true     # (bool, optional) Give this repo default_webhook; a repo can't also have its own webhook
 
 teams:                            # (list) Team configurations
   - name: core-team               # (string) Team name

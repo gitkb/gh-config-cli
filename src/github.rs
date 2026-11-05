@@ -506,7 +506,7 @@ impl GitHubClient {
         };
         // Printed, not logged: a dry run must show this whatever RUST_LOG says.
         if dry_run {
-            println!("[Dry Run] Would {change}");
+            writeln!(std::io::stdout(), "[Dry Run] Would {change}")?;
             return Ok(());
         }
         info!("Applying: {change}");
@@ -857,13 +857,13 @@ impl GitHubClient {
 
     pub async fn generate_config_and_write(&self, config_path: &str, dry_run: bool) -> AppResult<()> {
         info!("Generating config from GitHub org: {}", self.org);
-        // The file's default webhook stays the default, so regenerating never changes who is on it.
-        let default_webhook = match Config::from_file_with_defaults(config_path, None) {
-            Ok(existing) => existing.default_webhook,
+        // What the file records for this org stays, so regenerating never changes who is on the default webhook.
+        let file = match Config::from_file_with_defaults(config_path, None) {
+            Ok(file) => Some(file).filter(|file| file.org.eq_ignore_ascii_case(&self.org)),
             Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        let config = self.generate_unfiltered_config_from_org(default_webhook).await?;  // Make sure to call an unfiltered version
+        let config = self.generate_unfiltered_config_from_org(file.as_ref()).await?;  // Make sure to call an unfiltered version
 
         // ... rest of the YAML writing logic ...
         // (Ensure this part uses the full, unfiltered config)
@@ -893,9 +893,7 @@ impl GitHubClient {
              yaml_content.push_str(&format!("  url: {}\n", default_webhook.url));
              yaml_content.push_str(&format!("  content_type: {}\n", default_webhook.content_type));
              yaml_content.push_str("  events:\n");
-             let mut events = default_webhook.events.clone();
-             events.sort();
-             for event in &events {
+             for event in &default_webhook.events {
                  yaml_content.push_str(&format!("  - {}\n", event));
              }
              yaml_content.push_str("\n");
@@ -993,9 +991,12 @@ impl GitHubClient {
         Ok(())
     }
 
-    /// The org as a config. A repo whose webhook equals `default_webhook` opts in to it; without one, the first
-    /// webhook found becomes the default.
-    async fn generate_unfiltered_config_from_org(&self, default_webhook: Option<WebhookConfig>) -> AppResult<Config> {
+    /// The org as a config, reading `file` for what GitHub can't say: which default to keep and, as a config holds
+    /// one webhook per repo, which of a repo's webhooks to record. Without a default, the first webhook found is it.
+    async fn generate_unfiltered_config_from_org(&self, file: Option<&Config>) -> AppResult<Config> {
+        let mut default_webhook = file
+            .and_then(|file| file.default_webhook.clone())
+            .map(|wh| WebhookConfig { events: sorted(&wh.events), ..wh });
         // This is essentially the original logic of generate_config_from_org
          let mut repos = Vec::new();
         let repo_url = format!("{}/orgs/{}/repos?per_page=100", self.api_url, self.org);
@@ -1027,24 +1028,34 @@ impl GitHubClient {
             };
 
             let visibility = if repo["private"].as_bool().unwrap_or(false) { Some("private".to_string()) } else { Some("public".to_string()) };
+            let in_file = file.and_then(|file| file.repos.iter().find(|r| r.name == name));
             // Like settings above: report the repo and carry on, so one unreadable repo doesn't hide the rest.
-            let webhooks = self.get_webhooks(&name).await.unwrap_or_else(|e| {
-                error!("Failed to fetch webhooks for repo {}: {}. Its webhook is left out.", name, e);
-                Vec::new()
-            });
-            // A config holds one webhook per repo: the default if the repo has it, else its first.
-            let hook = webhooks.iter().find(|wh| default_webhook.as_ref().is_some_and(|d| d.url == wh.config.url));
-            let webhook = hook.or(webhooks.first()).map(|wh| WebhookConfig {
-                url: wh.config.url.clone(),
-                content_type: wh.config.content_type.clone(),
-                events: sorted(&wh.events),
-            });
+            let (use_default_webhook, webhook) = match self.get_webhooks(&name).await {
+                Ok(hooks) => {
+                    let with_url = |webhook: Option<&WebhookConfig>| hooks.iter().find(|wh| webhook.is_some_and(|w| w.url == wh.config.url));
+                    let hook = with_url(in_file.and_then(|r| r.webhook.as_ref())).or(with_url(default_webhook.as_ref())).or(hooks.first());
+                    let webhook = hook.map(|wh| WebhookConfig {
+                        url: wh.config.url.clone(),
+                        content_type: wh.config.content_type.clone(),
+                        events: sorted(&wh.events),
+                    });
+                    if default_webhook.is_none() {
+                        default_webhook.clone_from(&webhook);
+                    }
+                    let is_default = webhook.is_some() && webhook == default_webhook;
+                    (is_default, webhook.filter(|_| !is_default))
+                }
+                Err(e) => {
+                    error!("Failed to fetch webhooks for repo {}: {}. Its webhook stays as the file has it.", name, e);
+                    in_file.map_or((false, None), |r| (r.use_default_webhook, r.webhook.clone()))
+                }
+            };
 
             repos.push(Repo {
                 name,
                 settings,
                 visibility,
-                use_default_webhook: false,
+                use_default_webhook,
                 webhook,
                 branch_protections: vec![], // Add logic to fetch these if needed
             });
@@ -1086,16 +1097,6 @@ impl GitHubClient {
                         permission: permission.to_string(),
                     });
                 }
-            }
-        }
-
-        let default_webhook = default_webhook
-            .or_else(|| repos.iter().find_map(|r| r.webhook.clone()))
-            .map(|wh| WebhookConfig { events: sorted(&wh.events), ..wh });
-        for repo in &mut repos {
-            if repo.webhook.is_some() && repo.webhook == default_webhook {
-                repo.webhook = None;
-                repo.use_default_webhook = true;
             }
         }
 
@@ -1191,7 +1192,7 @@ impl GitHubClient {
         check_archived(&local_config)?;
 
         // --- Step 2: Fetch FULL GitHub org state (unfiltered, as sync-from-github would write) ---
-        let github_config = self.generate_unfiltered_config_from_org(local_config.default_webhook.clone()).await?;
+        let github_config = self.generate_unfiltered_config_from_org(Some(&local_config)).await?;
 
         // --- Step 3: Prepare final versions for diffing ---
         let mut diff_local_config = local_config.clone(); // Clone original local config
@@ -1210,7 +1211,7 @@ impl GitHubClient {
         diff_local_config.resolve_webhooks();
         diff_github_config.resolve_webhooks();
 
-        // --- Step 7: Sort both configs... (ensure BTreeMap logic is kept) ---
+        // --- Step 5: Sort both configs... (ensure BTreeMap logic is kept) ---
         // Repos
         diff_local_config.repos.sort_by(|a, b| a.name.cmp(&b.name));
         diff_github_config.repos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1229,7 +1230,7 @@ impl GitHubClient {
         diff_local_config.assignments.sort_by(|a, b| a.team.cmp(&b.team).then(a.repo.cmp(&b.repo)));
         diff_github_config.assignments.sort_by(|a, b| a.team.cmp(&b.team).then(a.repo.cmp(&b.repo)));
 
-        // --- Step 8: Serialize and Diff ---
+        // --- Step 6: Serialize and Diff ---
         let github_yaml = serde_yaml::to_string(&diff_github_config)?;
         let local_yaml = serde_yaml::to_string(&diff_local_config)?;
 
@@ -1284,19 +1285,16 @@ fn sorted(events: &[String]) -> Vec<String> {
 /// What sync would do to a repo's webhook, for people to read; `None` if it already matches.
 /// It names the URL's host only: the rest of a webhook URL is often a credential, and this reaches CI logs.
 fn webhook_change(org: &str, repo: &str, existing: Option<&WebhookResponse>, webhook: &WebhookConfig) -> Option<String> {
+    let parsed = reqwest::Url::parse(&webhook.url).ok();
+    let host = parsed.as_ref().and_then(|url| url.host_str()).unwrap_or("an unparsable URL");
     let events = sorted(&webhook.events);
-    match existing {
-        None => {
-            let parsed = reqwest::Url::parse(&webhook.url).ok();
-            let host = parsed.as_ref().and_then(|url| url.host_str()).unwrap_or("an unparsable URL");
-            Some(format!("create webhook on {org}/{repo}: {host}, content_type {}, events {events:?}", webhook.content_type))
-        }
-        Some(hook) if sorted(&hook.events) != events || hook.config.content_type != webhook.content_type => Some(format!(
-            "update webhook on {org}/{repo}: events {:?} -> {events:?}, content_type {} -> {}",
-            sorted(&hook.events), hook.config.content_type, webhook.content_type
-        )),
-        Some(_) => None,
-    }
+    let Some(hook) = existing else {
+        return Some(format!("create webhook on {org}/{repo}: {host}, content_type {}, events {events:?}", webhook.content_type));
+    };
+    let current = sorted(&hook.events);
+    (current != events || hook.config.content_type != webhook.content_type).then(|| {
+        format!("update webhook on {org}/{repo}: {host}, events {current:?} -> {events:?}, content_type {} -> {}", hook.config.content_type, webhook.content_type)
+    })
 }
 
 /// The `rel="next"` URL of GitHub's `Link` header, if there is a next page.
@@ -1607,18 +1605,20 @@ mod tests {
         let hooks = |repo: &str| match repo {
             "first" => json!([hook("https://hooks.example/other")]),
             "off" => json!([]),
+            // Not a list, so reading its hooks fails.
+            "unreadable" => json!(null),
             "both" => json!([hook("https://hooks.example/other"), hook("https://hooks.example/h")]),
             _ => json!([hook("https://hooks.example/h")]),
         };
-        let _mocks = mock_org_with_hooks(&mut server, &[("first", false), ("off", false), ("both", false), ("on", false)], hooks).await;
-        let config = write_file("org: o\ndefault_webhook:\n  url: https://hooks.example/h\n  content_type: json\n  events: [push, issues]\n");
+        let _mocks = mock_org_with_hooks(&mut server, &[("first", false), ("off", false), ("both", false), ("on", false), ("unreadable", false)], hooks).await;
+        let config = write_file("org: o\ndefault_webhook:\n  url: https://hooks.example/h\n  content_type: json\n  events: [push, issues]\nrepos:\n- name: unreadable\n  use_default_webhook: true\n");
         let path = config.path().to_str().expect("utf-8 path");
 
         client(&server).generate_config_and_write(path, false).await.expect("generate");
         let yaml = std::fs::read_to_string(path).expect("read generated config");
         let generated = crate::config::Config::from_file_with_defaults(path, None).expect("generated config parses");
         assert_eq!(generated.default_webhook.expect("default kept").url, "https://hooks.example/h");
-        for repo in ["on", "both"] {
+        for repo in ["on", "both", "unreadable"] {
             assert!(repo_block(&yaml, repo).contains("use_default_webhook: true"), "{yaml}");
         }
         for repo in ["first", "off"] {
@@ -1627,6 +1627,47 @@ mod tests {
         assert!(repo_block(&yaml, "first").contains("https://hooks.example/other"), "{yaml}");
         assert!(!repo_block(&yaml, "off").contains("webhook"), "{yaml}");
         assert!(!client(&server).diff(path).await.expect("diff"), "the regenerated config differs from GitHub");
+    }
+
+    #[tokio::test]
+    async fn the_webhook_recorded_for_a_repo_is_the_same_whatever_the_file_holds_and_github_returns() {
+        let hook = |url: &str| json!({"id": 1, "url": "u", "config": {"url": url, "content_type": "json"}, "events": ["push"]});
+        let (c, d) = (hook("https://hooks.example/c"), hook("https://hooks.example/d"));
+        let default = "default_webhook:\n  url: https://hooks.example/d\n  content_type: json\n  events: [push]\n";
+        let own = "repos:\n- name: b\n  webhook:\n    url: https://hooks.example/c\n    content_type: json\n    events: [push]\n";
+        for file in [None, Some("org: o\n".to_string()), Some(format!("org: o\n{default}")), Some(format!("org: o\n{default}{own}"))] {
+            for b_hooks in [json!([c, d]), json!([d, c])] {
+                for repos in [[("a", false), ("b", false)], [("b", false), ("a", false)]] {
+                    let mut server = mockito::Server::new_async().await;
+                    let _mocks = mock_org_with_hooks(&mut server, &repos, |repo| if repo == "a" { json!([d]) } else { b_hooks.clone() }).await;
+                    let dir = tempfile::tempdir().expect("create temp dir");
+                    let path = dir.path().join("config.yaml");
+                    if let Some(file) = &file {
+                        std::fs::write(&path, file).expect("write config");
+                    }
+                    let path = path.to_str().expect("utf-8 path");
+
+                    client(&server).generate_config_and_write(path, false).await.expect("export");
+                    let first = std::fs::read_to_string(path).expect("read export");
+                    assert!(!client(&server).diff(path).await.expect("diff"), "false difference from {file:?} with {b_hooks} and {repos:?}:\n{first}");
+                    client(&server).generate_config_and_write(path, false).await.expect("second export");
+                    assert_eq!(first, std::fs::read_to_string(path).expect("read export"), "a second export changed the file");
+                    if file.as_deref().is_some_and(|f| f.contains("- name: b")) {
+                        assert!(repo_block(&first, "b").contains("https://hooks.example/c"), "b lost its own webhook:\n{first}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_from_org_keeps_nothing_from_another_orgs_file() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org(&mut server, &[("r", false)]).await;
+        let file = write_file("org: other\ndefault_webhook:\n  url: https://other.example/h\n  content_type: json\n  events: [push]\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        assert!(!std::fs::read_to_string(path).expect("read export").contains("other.example"));
     }
 
     #[test]
@@ -1645,6 +1686,9 @@ mod tests {
             events: vec!["issues".into(), "push".into()],
         };
         assert_eq!(webhook_change("o", "r", Some(&same), &webhook), None, "the order of events isn't a change");
+        let changed = WebhookResponse { events: vec!["push".into()], ..same };
+        let line = webhook_change("o", "r", Some(&changed), &webhook).expect("other events are a change");
+        assert!(line.contains("hooks.example") && !line.contains("token"), "{line}");
     }
 
     #[tokio::test]
