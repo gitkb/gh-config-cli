@@ -10,13 +10,12 @@
 */
 
 use crate::config::{Assignment, Repo, RepoSettings, Team, User, WebhookConfig, Config};
-use crate::github_api_mapping_generated::get_github_api_mapping;
 use crate::error::{AppError, AppResult};
 use colored::*;
 use log::{debug, info, error};
 use reqwest::Client;
 use serde_json::json;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet}; // Added HashSet
 use similar::{ChangeTag, TextDiff};
 use std::fs::File;
@@ -64,6 +63,21 @@ struct PermissionDetails {
     pull: bool,
     push: bool,
     admin: bool,
+    // Finer levels GitHub reports alongside the three above.
+    #[serde(default)]
+    triage: bool,
+    #[serde(default)]
+    maintain: bool,
+}
+
+impl PermissionDetails {
+    /// The highest level granted, in the config's names (`pull`, `triage`, `push`, `maintain`, `admin`).
+    /// `None` when no level is granted.
+    fn level(&self) -> Option<&'static str> {
+        [(self.admin, "admin"), (self.maintain, "maintain"), (self.push, "push"), (self.triage, "triage"), (self.pull, "pull")]
+            .into_iter()
+            .find_map(|(granted, name)| granted.then_some(name))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -264,6 +278,11 @@ impl GitHubClient {
     }
 
     async fn get(&self, url: &str) -> AppResult<reqwest::Response> {
+        self.get_as(url, "application/vnd.github+json").await
+    }
+
+    /// A GET that asks for the `accept` media type.
+    async fn get_as(&self, url: &str, accept: &str) -> AppResult<reqwest::Response> {
         // --- Add Enhanced Logging ---
         debug!("Attempting to build GET request for URL: '{}'", url);
         if url.trim().is_empty() {
@@ -299,7 +318,7 @@ impl GitHubClient {
         // Chain the rest - if it fails here, it's likely header related
         let request_builder = builder_result
             .header(reqwest::header::AUTHORIZATION, auth_header_value) // Use constant for clarity
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::ACCEPT, accept)
             .header(reqwest::header::USER_AGENT, "gh-config");
 
         // --- Log before send ---
@@ -318,6 +337,35 @@ impl GitHubClient {
             error!("GET {} failed with status {}: {}", url, status, text);
             Err(AppError::GitHubApi(text))
         }
+    }
+
+    /// Every item of a GitHub list, following `Link: rel="next"` from page to page.
+    async fn get_all<T: DeserializeOwned>(&self, url: &str) -> AppResult<Vec<T>> {
+        let mut items = Vec::new();
+        let mut next = Some(url.to_string());
+        while let Some(url) = next {
+            let response = self.get(&url).await?;
+            next = match next_page(response.headers()) {
+                None => None,
+                Some(target) => {
+                    // A relative target (RFC 8288) resolves against this page's URL.
+                    let next = reqwest::Url::parse(&url)
+                        .and_then(|base| base.join(&target))
+                        .map_err(|e| AppError::GitHubApi(format!("Bad next page {target} of {url}: {e}")))?
+                        .to_string();
+                    // The token goes only to the API itself, never to another host a `Link` header names.
+                    if !next.starts_with(&format!("{}/", self.api_url)) {
+                        return Err(AppError::GitHubApi(format!("Refusing next page {next} of {url}: it is outside {}", self.api_url)));
+                    }
+                    Some(next)
+                }
+            };
+            let text = response.text().await?;
+            let page: Vec<T> = serde_json::from_str(&text)
+                .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", url, e)))?;
+            items.extend(page);
+        }
+        Ok(items)
     }
 
     /// Fetch all settings for a repo as a HashMap<String, serde_yaml::Value>
@@ -388,12 +436,7 @@ impl GitHubClient {
     }
 
     async fn get_team_repos(&self, team_name: &str) -> AppResult<Vec<TeamRepoResponse>> {
-        let full_url = format!("{}/orgs/{}/teams/{}/repos?per_page=100", self.api_url, self.org, team_name);
-        let response = self.get(&full_url).await?;
-        let text = response.text().await?;
-        let repos: Vec<TeamRepoResponse> = serde_json::from_str(&text)
-            .map_err(|e| AppError::GitHubApi(format!("Failed to parse team repos: {}", e)))?;
-        Ok(repos)
+        self.get_all(&format!("{}/orgs/{}/teams/{}/repos?per_page=100", self.api_url, self.org, team_name)).await
     }
 
     ///
@@ -407,12 +450,7 @@ impl GitHubClient {
     /// * `Err(AppError)` if the API call or parsing fails.
     ///
     pub async fn get_webhooks(&self, repo_name: &str) -> AppResult<Vec<WebhookResponse>> {
-        let full_url = format!("{}/repos/{}/{}/hooks", self.api_url, self.org, repo_name);
-        let response = self.get(&full_url).await?;
-        let text = response.text().await?;
-        let webhooks: Vec<WebhookResponse> = serde_json::from_str(&text)
-            .map_err(|e| AppError::GitHubApi(format!("Failed to parse webhooks: {}", e)))?;
-        Ok(webhooks)
+        self.get_all(&format!("{}/repos/{}/{}/hooks?per_page=100", self.api_url, self.org, repo_name)).await
     }
 
     async fn create_webhook(&self, repo_name: &str, webhook: &WebhookConfig) -> AppResult<()> {
@@ -513,7 +551,7 @@ impl GitHubClient {
     /// `archived` is skipped here: `sync` unarchives before and archives after everything else.
     pub async fn update_repo_settings(&self, repo: &Repo, current: &RepoSettings, dry_run: bool) -> AppResult<()> {
         let desired = &repo.settings;
-        let mapping = get_github_api_mapping();
+        let mapping = crate::api_mapping::repo_settings();
 
         // --- Optimization suggestion (Apply after fixing URL): ---
         // Instead of sending one PATCH per setting, collect all PATCHes for the same endpoint.
@@ -626,12 +664,8 @@ impl GitHubClient {
     // Add a helper to get team members
     async fn get_team_members(&self, team_slug: &str) -> AppResult<HashSet<String>> {
         let url = format!("{}/orgs/{}/teams/{}/members?per_page=100", self.api_url, self.org, team_slug);
-        let response = self.get(&url).await?;
-        let members_json: Vec<serde_json::Value> = response.json().await.map_err(AppError::Http)?;
-        let members = members_json.iter()
-            .filter_map(|m| m["login"].as_str().map(String::from))
-            .collect::<HashSet<String>>();
-        Ok(members)
+        let members: Vec<serde_json::Value> = self.get_all(&url).await?;
+        Ok(members.iter().filter_map(|m| m["login"].as_str().map(String::from)).collect())
     }
 
     ///
@@ -816,25 +850,16 @@ impl GitHubClient {
             "{}/orgs/{}/teams/{}/repos/{}/{}",
             self.api_url, self.org, team, self.org, repo
         );
-        match self.get(&full_url).await {
+        // Without this media type GitHub answers a bare 204, which says nothing about the level.
+        match self.get_as(&full_url, "application/vnd.github.v3.repository+json").await {
             Ok(response) => {
                 let text = response.text().await?;
                 if text.is_empty() {
-                    debug!("Empty response body from GET {}, assuming permission exists but not detailed", full_url);
-                    return Ok(Some("push".to_string()));
+                    return Err(AppError::GitHubApi(format!("GET {} returned an empty body instead of the team's permissions", full_url)));
                 }
                 let perms: TeamRepoResponse = serde_json::from_str(&text)
                     .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", full_url, e)))?;
-                let permission = if perms.permissions.admin {
-                    "admin"
-                } else if perms.permissions.push {
-                    "push"
-                } else if perms.permissions.pull {
-                    "pull"
-                } else {
-                    "none"
-                };
-                Ok(Some(permission.to_string()))
+                Ok(perms.permissions.level().map(String::from))
             }
             Err(AppError::GitHubApi(e)) if e.contains("404") => Ok(None),
             Err(e) => Err(e),
@@ -982,8 +1007,7 @@ impl GitHubClient {
         // This is essentially the original logic of generate_config_from_org
          let mut repos = Vec::new();
         let repo_url = format!("{}/orgs/{}/repos?per_page=100", self.api_url, self.org);
-        let repo_response = self.get(&repo_url).await?;
-        let repo_json: Vec<serde_json::Value> = repo_response.json().await.map_err(AppError::Http)?;
+        let repo_json: Vec<serde_json::Value> = self.get_all(&repo_url).await?;
 
         for repo in repo_json {
             let name = repo["name"].as_str().ok_or_else(|| AppError::GitHubApi("Missing repo name".to_string()))?.to_string();
@@ -1028,25 +1052,18 @@ impl GitHubClient {
                 visibility,
                 webhook,
                 branch_protections: vec![], // Add logic to fetch these if needed
-                extra: std::collections::HashMap::new(),
             });
         }
 
         // Fetch teams, users, assignments as before (full state needed for generation)
         let mut teams = Vec::new();
         let team_url = format!("{}/orgs/{}/teams?per_page=100", self.api_url, self.org);
-        let team_response = self.get(&team_url).await?;
-        let team_json: Vec<serde_json::Value> = team_response.json().await.map_err(AppError::Http)?;
+        let team_json: Vec<serde_json::Value> = self.get_all(&team_url).await?;
 
         for team in team_json {
             // Fetch full team data including members
              let name = team["slug"].as_str().ok_or_else(|| AppError::GitHubApi("Missing team slug".to_string()))?.to_string();
-            let members_url = format!("{}/orgs/{}/teams/{}/members?per_page=100", self.api_url, self.org, name);
-            let members_response = self.get(&members_url).await?;
-            let members_json: Vec<serde_json::Value> = members_response.json().await.map_err(AppError::Http)?;
-            let mut members = members_json.iter()
-                .filter_map(|m| m["login"].as_str().map(String::from))
-                .collect::<Vec<String>>();
+            let mut members: Vec<String> = self.get_team_members(&name).await?.into_iter().collect();
             members.sort();
 
             teams.push(Team { name, members });
@@ -1054,8 +1071,7 @@ impl GitHubClient {
 
         let mut users = Vec::new();
         let members_url = format!("{}/orgs/{}/members?per_page=100", self.api_url, self.org);
-        let members_response = self.get(&members_url).await?;
-        let members_json: Vec<serde_json::Value> = members_response.json().await.map_err(AppError::Http)?;
+        let members_json: Vec<serde_json::Value> = self.get_all(&members_url).await?;
 
         for member in members_json {
             let login = member["login"].as_str().ok_or_else(|| AppError::GitHubApi("Missing member login".to_string()))?.to_string();
@@ -1068,16 +1084,7 @@ impl GitHubClient {
         for team in &teams {
             let team_repos = self.get_team_repos(&team.name).await?;
             for repo in team_repos {
-                 let permission = if repo.permissions.admin {
-                    "admin"
-                } else if repo.permissions.push {
-                    "push" // Use push/pull
-                } else if repo.permissions.pull {
-                    "pull"
-                } else {
-                    "none"
-                };
-                if permission != "none" {
+                if let Some(permission) = repo.permissions.level() {
                     assignments.push(Assignment {
                         repo: repo.name.clone(),
                         team: team.name.clone(),
@@ -1099,7 +1106,6 @@ impl GitHubClient {
             assignments,
             default_webhook,
             default_branch_protections: vec![], // Add logic if needed
-            extra: std::collections::HashMap::new(),
         })
     }
 
@@ -1132,9 +1138,8 @@ impl GitHubClient {
         }
 
         // An archived repo is read-only: unarchive before its other changes, archive after all of them,
-        // and leave a repo that stays archived alone.
+        // and leave the settings and webhook of a repo that stays archived alone.
         let mut to_archive = Vec::new();
-        let mut stays_archived = HashSet::new();
         for repo in &config.repos {
             // --- Add logging just before the failing call ---
             info!("Processing repo: {}/{}", self.org, repo.name);
@@ -1150,8 +1155,7 @@ impl GitHubClient {
                 (true, Some(false)) => self.set_archived(&repo.name, false, dry_run).await?,
                 (true, desired) => {
                     let hint = if desired.is_none() { format!(" Set `{ARCHIVED}: false` to unarchive it.") } else { String::new() };
-                    info!("Skipping {}/{}: it is archived, so its settings, webhook and team access are left as they are.{}", self.org, repo.name, hint);
-                    stays_archived.insert(repo.name.as_str());
+                    info!("Skipping {}/{}: it is archived, so its settings and webhook are left as they are.{}", self.org, repo.name, hint);
                     continue;
                 }
                 (false, Some(true)) => to_archive.push(repo.name.as_str()),
@@ -1172,21 +1176,9 @@ impl GitHubClient {
             self.add_user_to_org(user, dry_run).await?;
         }
 
-        // Assignments
-        // Team access can name repos the config doesn't list; those are checked on GitHub once each.
-        let mut checked: HashSet<&str> = config.repos.iter().map(|r| r.name.as_str()).collect();
+        // Assignments, archived repos included: GitHub decides whether their team access can change,
+        // so sync never skips a change that diff reports.
         for assignment in &config.assignments {
-            let repo = assignment.repo.as_str();
-            if checked.insert(repo) {
-                let current = self.get_repo_settings(repo).await?;
-                if archived(&current, repo)? == Some(true) {
-                    info!("Skipping team access to {}/{}: it is archived. List it under `repos` with `{}: false` to unarchive it.", self.org, repo, ARCHIVED);
-                    stays_archived.insert(repo);
-                }
-            }
-            if stays_archived.contains(repo) {
-                continue;
-            }
             info!("Processing assignment: Team '{}' on Repo '{}'", assignment.team, assignment.repo); // Add similar logging
             self.assign_team_to_repo(assignment, dry_run).await?;
         }
@@ -1348,6 +1340,17 @@ impl GitHubClient {
 }
 
 
+/// The `rel="next"` URL of GitHub's `Link` header, if there is a next page.
+fn next_page(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    link.split(',').find_map(|part| {
+        let (url, params) = part.split_once(';')?;
+        params
+            .split(';')
+            .any(|p| p.trim() == r#"rel="next""#)
+            .then(|| url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -1408,19 +1411,24 @@ mod tests {
     }
 
     /// Mocks the GET side of org `o`: each `(name, archived)` repo with one shared webhook, no teams, no members.
+    /// Like GitHub, the repo list comes in pages linked by `Link: rel="next"`, here one repo per page.
     async fn mock_org(server: &mut mockito::ServerGuard, repos: &[(&str, bool)]) -> Vec<mockito::Mock> {
-        let list: Vec<_> = repos.iter().map(|(name, _)| json!({"name": name, "private": false})).collect();
         let mut mocks = vec![
-            server.mock("GET", "/orgs/o/repos?per_page=100").with_body(json!(list).to_string()).create_async().await,
             server.mock("GET", "/orgs/o/teams?per_page=100").with_body("[]").create_async().await,
             server.mock("GET", "/orgs/o/members?per_page=100").with_body("[]").create_async().await,
         ];
+        let page = |n: usize| if n == 1 { "/orgs/o/repos?per_page=100".to_string() } else { format!("/orgs/o/repos?per_page=100&page={n}") };
         let hooks = json!([{"id": 1, "url": "u", "config": {"url": "https://hooks.example/h", "content_type": "json"}, "events": ["push"]}]);
-        for (name, archived) in repos {
+        for (i, (name, archived)) in repos.iter().enumerate() {
+            let mut list = server.mock("GET", page(i + 1).as_str()).with_body(json!([{"name": name, "private": false}]).to_string());
+            if i + 1 < repos.len() {
+                list = list.with_header("link", &format!(r#"<{0}{1}>; rel="next", <{0}{2}>; rel="last""#, server.url(), page(i + 2), page(repos.len())));
+            }
+            mocks.push(list.create_async().await);
             let repo = json!({"name": name, "private": false, "archived": archived,
                 "allow_merge_commit": false, "allow_squash_merge": true, "allow_rebase_merge": true});
             mocks.push(server.mock("GET", format!("/repos/o/{name}").as_str()).with_body(repo.to_string()).create_async().await);
-            mocks.push(server.mock("GET", format!("/repos/o/{name}/hooks").as_str()).with_body(hooks.to_string()).create_async().await);
+            mocks.push(server.mock("GET", format!("/repos/o/{name}/hooks?per_page=100").as_str()).with_body(hooks.to_string()).create_async().await);
         }
         mocks
     }
@@ -1457,6 +1465,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_from_org_reads_every_page_of_repos() {
+        let mut server = mockito::Server::new_async().await;
+        let names = ["a", "b", "c"];
+        let _mocks = mock_org(&mut server, &names.map(|n| (n, false))).await;
+        let out = write_file("");
+        let path = out.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("sync-from-org");
+        let yaml = std::fs::read_to_string(path).expect("read output");
+        for name in names {
+            assert!(yaml.contains(&format!("- name: {name}\n")), "repo {name} on a later page is missing:\n{yaml}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_finds_its_webhook_on_a_later_page_instead_of_adding_a_duplicate() {
+        let mut server = mockito::Server::new_async().await;
+        let hook = |id: i64, url: &str| json!([{"id": id, "url": "u", "config": {"url": url, "content_type": "json"}, "events": ["push"]}]).to_string();
+        let page2 = "/repos/o/r/hooks?per_page=100&page=2";
+        let _mocks = [
+            server.mock("GET", "/repos/o/r").with_body(r#"{"name":"r","archived":false}"#).create_async().await,
+            server
+                .mock("GET", mockito::Matcher::Regex(r"^/repos/o/r/hooks(\?per_page=100)?$".into()))
+                // A relative target (RFC 8288) resolves against the request URL; mock_org covers absolute ones.
+                .with_header("link", &format!(r#"<{page2}>; rel="next""#))
+                .with_body(hook(1, "https://other.example/x"))
+                .create_async()
+                .await,
+            server.mock("GET", page2).with_body(hook(31, "https://hooks.example/h")).create_async().await,
+        ];
+        let create = server.mock("POST", "/repos/o/r/hooks").expect(0).create_async().await;
+        let config = write_file("org: o\nrepos:\n- name: r\n  webhook: {url: https://hooks.example/h, content_type: json, events: [push]}\n");
+        client(&server).sync(config.path().to_str().expect("utf-8 path"), false).await.expect("sync");
+        create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn settings_that_write_outside_the_repo_are_refused_before_any_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mut any = Vec::new();
+        for method in ["GET", "POST", "PATCH", "PUT", "DELETE"] {
+            any.push(server.mock(method, mockito::Matcher::Any).expect(0).create_async().await);
+        }
+        for (key, writes) in [
+            ("armored_public_key", "POST /user/gpg_keys"),
+            ("default_repository_permission", "PATCH /orgs/{org}"),
+            ("actions", "PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}"),
+        ] {
+            let config = write_file(&format!(
+                "org: o\ndefault_webhook: {{url: https://h.example/x, content_type: json, events: [push]}}\nrepos:\n- name: r\n  settings:\n    {key}: x\n"
+            ));
+            let path = config.path().to_str().expect("utf-8 path");
+            for dry_run in [true, false] {
+                let err = client(&server).sync(path, dry_run).await.expect_err(&format!("accepted `{key}` under a repo's settings"));
+                let err = err.to_string();
+                for part in [path, "repos[0].settings", key, writes] {
+                    assert!(err.contains(part), "error for {key} doesn't name {part}: {err}");
+                }
+            }
+        }
+        for mock in any {
+            mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_next_page_on_another_host_is_refused() {
+        let mut server = mockito::Server::new_async().await;
+        let _page = server
+            .mock("GET", "/repos/o/r/hooks?per_page=100")
+            .with_header("link", r#"<https://elsewhere.example/repos/o/r/hooks?page=2>; rel="next""#)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let err = client(&server).get_webhooks("r").await.expect_err("followed a Link to another host");
+        assert!(err.to_string().contains("Refusing next page https://elsewhere.example/"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn team_permission_is_read_from_the_repository_media_type_never_guessed() {
+        let mut server = mockito::Server::new_async().await;
+        let check = |repo: &str| format!("/orgs/o/teams/devs/repos/o/{repo}");
+        let repository = "application/vnd.github.v3.repository+json";
+        let perms = |p: &str| format!(r#"{{"name":"x","role_name":"x","permissions":{p}}}"#);
+        let mut mocks = Vec::new();
+        for (repo, body) in [
+            ("read", Some(perms(r#"{"admin":false,"maintain":false,"push":false,"triage":false,"pull":true}"#))),
+            ("maintained", Some(perms(r#"{"admin":false,"maintain":true,"push":true,"triage":true,"pull":true}"#))),
+            ("triaged", Some(perms(r#"{"admin":false,"maintain":false,"push":false,"triage":true,"pull":true}"#))),
+            ("empty", None),
+        ] {
+            // Like GitHub: without the repository media type the check is a bare 204.
+            mocks.push(server.mock("GET", check(repo).as_str()).match_header("accept", "application/vnd.github+json").with_status(204).create_async().await);
+            let with_type = server.mock("GET", check(repo).as_str()).match_header("accept", repository);
+            mocks.push(match body {
+                Some(body) => with_type.with_body(body),
+                None => with_type.with_status(204),
+            }.create_async().await);
+        }
+        let client = client(&server);
+        for (repo, want) in [("read", "pull"), ("maintained", "maintain"), ("triaged", "triage")] {
+            let got = client.get_team_repo_permission("devs", repo).await.expect("permission");
+            assert_eq!(got.as_deref(), Some(want), "team permission on {repo}");
+        }
+        let err = client.get_team_repo_permission("devs", "empty").await.expect_err("guessed a permission from an empty body");
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[tokio::test]
     async fn diff_round_trips_archived() {
         let mut server = mockito::Server::new_async().await;
         let _mocks = mock_org(&mut server, &[("live", false), ("old", true)]).await;
@@ -1483,7 +1599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_unarchives_first_archives_last_and_leaves_archived_repos_alone() {
+    async fn sync_unarchives_first_archives_last_and_leaves_archived_repo_settings_alone() {
         let mut server = mockito::Server::new_async().await;
         // kept stays archived, going gets archived, back gets unarchived; hidden is archived and only has team access.
         let _mocks = mock_org(&mut server, &[("kept", true), ("going", false), ("back", true), ("hidden", true)]).await;
@@ -1493,6 +1609,8 @@ mod tests {
             ("PATCH", "/repos/o/going"),
             ("PATCH", "/repos/o/back"),
             ("PUT", "/orgs/o/teams/devs/repos/o/going"),
+            ("PUT", "/orgs/o/teams/devs/repos/o/kept"),
+            ("PUT", "/orgs/o/teams/devs/repos/o/hidden"),
         ] {
             let writes = writes.clone();
             let label = format!("{method} {path}");
@@ -1508,13 +1626,18 @@ mod tests {
                     .await,
             );
         }
-        // Nothing else is mocked: any write to `kept` gets mockito's 501 and fails the sync.
-        let _no_access = server
-            .mock("GET", "/orgs/o/teams/devs/repos/o/going")
-            .with_status(404)
-            .with_body(r#"{"message":"Not Found","status":"404"}"#)
-            .create_async()
-            .await;
+        // Nothing else is mocked: any settings or webhook write to `kept` gets mockito's 501 and fails the sync.
+        let mut no_access = Vec::new();
+        for repo in ["going", "kept", "hidden"] {
+            no_access.push(
+                server
+                    .mock("GET", format!("/orgs/o/teams/devs/repos/o/{repo}").as_str())
+                    .with_status(404)
+                    .with_body(r#"{"message":"Not Found","status":"404"}"#)
+                    .create_async()
+                    .await,
+            );
+        }
         let config = write_file(
             "org: o
 default_webhook:
@@ -1552,6 +1675,9 @@ assignments:
                 r#"PATCH /repos/o/back {"archived":false}"#,
                 r#"PATCH /repos/o/back {"allow_merge_commit":true}"#,
                 r#"PUT /orgs/o/teams/devs/repos/o/going {"permission":"push"}"#,
+                // Team access isn't skipped on archived repos: GitHub decides, so sync and diff agree.
+                r#"PUT /orgs/o/teams/devs/repos/o/kept {"permission":"push"}"#,
+                r#"PUT /orgs/o/teams/devs/repos/o/hidden {"permission":"push"}"#,
                 r#"PATCH /repos/o/going {"archived":true}"#,
             ]
         );
