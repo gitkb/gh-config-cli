@@ -196,6 +196,22 @@ assignments:
     permission: push
 ```
 
+### Archiving repos
+
+`archived` is a repo setting like any other:
+
+```yaml
+repos:
+  - name: old-tool
+    settings:
+      archived: true    # archive it; `archived: false` unarchives it
+```
+
+- `sync-from-org` writes `archived: true` for repos that are archived on GitHub, and nothing for the others.
+- `sync` unarchives a repo before changing anything else on it, and archives repos after every other change, because GitHub makes an archived repo read-only.
+- A repo that is archived on GitHub and has no `archived: false` is left alone: its settings, webhook and team access aren't changed, and `sync` logs one line saying so. Leaving `archived` out never unarchives a repo.
+- `diff` shows archiving and unarchiving as a change to the `archived` line.
+
 ### Defaults and Merging
 
 You can provide a `defaults.config.yaml` file to specify org-wide or policy defaults. All fields are optional. The main config takes precedence over defaults.

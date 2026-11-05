@@ -23,6 +23,20 @@ use std::fs::File;
 use std::io::Write;
 
 const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+/// The repo setting that archives (true) or unarchives (false) a repo.
+const ARCHIVED: &str = "archived";
+
+/// The `archived` setting as a bool, or `None` when the settings don't name it.
+fn archived(settings: &RepoSettings, repo: &str) -> AppResult<Option<bool>> {
+    settings
+        .get(ARCHIVED)
+        .map(|v| {
+            v.as_bool().ok_or_else(|| {
+                AppError::GitHubApi(format!("Repo {repo}: `{ARCHIVED}` must be true or false, got {v:?}"))
+            })
+        })
+        .transpose()
+}
 
 #[derive(Debug, Deserialize)]
 struct TeamResponse {
@@ -75,6 +89,8 @@ pub struct GitHubClient {
     token: String,
     /// Name of the GitHub organization to operate on.
     pub org: String,
+    /// Base URL of the GitHub REST API (tests point it at a mock server).
+    api_url: String,
 }
 
 impl GitHubClient {
@@ -88,6 +104,7 @@ impl GitHubClient {
             client: Client::new(),
             token: token.to_string(),
             org: org.to_string(),
+            api_url: GITHUB_API_BASE_URL.to_string(),
         }
     }
 
@@ -300,7 +317,7 @@ impl GitHubClient {
 
     /// Fetch all settings for a repo as a HashMap<String, serde_yaml::Value>
     async fn get_repo_settings(&self, repo_name: &str) -> AppResult<RepoSettings> {
-        let full_url = format!("{}/repos/{}/{}", GITHUB_API_BASE_URL, self.org, repo_name);
+        let full_url = format!("{}/repos/{}/{}", self.api_url, self.org, repo_name);
         let response = self.get(&full_url).await?;
         let text = response.text().await?;
         if text.is_empty() {
@@ -326,7 +343,7 @@ impl GitHubClient {
     }
 
     async fn get_team(&self, team_name: &str) -> AppResult<Option<TeamResponse>> {
-        let full_url = format!("{}/orgs/{}/teams/{}", GITHUB_API_BASE_URL, self.org, team_name);
+        let full_url = format!("{}/orgs/{}/teams/{}", self.api_url, self.org, team_name);
         match self.get(&full_url).await {
             Ok(response) => {
                 let text = response.text().await?;
@@ -348,7 +365,7 @@ impl GitHubClient {
     }
 
     async fn get_user_membership(&self, login: &str) -> AppResult<Option<String>> {
-        let full_url = format!("{}/orgs/{}/memberships/{}", GITHUB_API_BASE_URL, self.org, login);
+        let full_url = format!("{}/orgs/{}/memberships/{}", self.api_url, self.org, login);
         match self.get(&full_url).await {
             Ok(response) => {
                 let text = response.text().await?;
@@ -366,7 +383,7 @@ impl GitHubClient {
     }
 
     async fn get_team_repos(&self, team_name: &str) -> AppResult<Vec<TeamRepoResponse>> {
-        let full_url = format!("{}/orgs/{}/teams/{}/repos?per_page=100", GITHUB_API_BASE_URL, self.org, team_name);
+        let full_url = format!("{}/orgs/{}/teams/{}/repos?per_page=100", self.api_url, self.org, team_name);
         let response = self.get(&full_url).await?;
         let text = response.text().await?;
         let repos: Vec<TeamRepoResponse> = serde_json::from_str(&text)
@@ -385,7 +402,7 @@ impl GitHubClient {
     /// * `Err(AppError)` if the API call or parsing fails.
     ///
     pub async fn get_webhooks(&self, repo_name: &str) -> AppResult<Vec<WebhookResponse>> {
-        let full_url = format!("{}/repos/{}/{}/hooks", GITHUB_API_BASE_URL, self.org, repo_name);
+        let full_url = format!("{}/repos/{}/{}/hooks", self.api_url, self.org, repo_name);
         let response = self.get(&full_url).await?;
         let text = response.text().await?;
         let webhooks: Vec<WebhookResponse> = serde_json::from_str(&text)
@@ -394,7 +411,7 @@ impl GitHubClient {
     }
 
     async fn create_webhook(&self, repo_name: &str, webhook: &WebhookConfig) -> AppResult<()> {
-        let url = format!("{}/repos/{}/{}/hooks", GITHUB_API_BASE_URL, self.org, repo_name);
+        let url = format!("{}/repos/{}/{}/hooks", self.api_url, self.org, repo_name);
     
         let body = json!({
             "name": "web", // Standard name for webhooks
@@ -414,7 +431,7 @@ impl GitHubClient {
     }
 
     async fn update_webhook(&self, repo_name: &str, hook_id: i64, webhook: &WebhookConfig) -> AppResult<()> {
-        let url = format!("{}/repos/{}/{}/hooks/{}", GITHUB_API_BASE_URL, self.org, repo_name, hook_id);
+        let url = format!("{}/repos/{}/{}/hooks/{}", self.api_url, self.org, repo_name, hook_id);
     
         let body = json!({
             // Note: Do not include "name" or "active" when updating
@@ -488,8 +505,8 @@ impl GitHubClient {
     /// - Logs actions in dry-run mode instead of performing them.
     /// - Also manages webhooks if defined in the repo configuration.
     ///
-    pub async fn update_repo_settings(&self, repo: &Repo, dry_run: bool) -> AppResult<()> {
-        let current = self.get_repo_settings(&repo.name).await?;
+    /// `archived` is skipped here: `sync` unarchives before and archives after everything else.
+    pub async fn update_repo_settings(&self, repo: &Repo, current: &RepoSettings, dry_run: bool) -> AppResult<()> {
         let desired = &repo.settings;
         let mapping = get_github_api_mapping();
 
@@ -499,7 +516,7 @@ impl GitHubClient {
         let mut pending_updates: HashMap<String, (String, serde_json::Map<String, serde_json::Value>)> = HashMap::new();
         // The tuple stores (HTTP Method, Body Map)
 
-        for (k, v_desired) in desired.iter() {
+        for (k, v_desired) in desired.iter().filter(|(k, _)| k.as_str() != ARCHIVED) {
             if let Some(field_map) = mapping.get(k.as_str()) {
                 let v_current = current.get(k);
                 if v_current != Some(v_desired) {
@@ -511,7 +528,7 @@ impl GitHubClient {
                         .replace("{repo}", &repo.name); // Add other replacements if needed (e.g., {team_slug})
 
                     // ****** THIS IS THE KEY FIX ******
-                    let full_url = format!("{}{}", GITHUB_API_BASE_URL, relative_path);
+                    let full_url = format!("{}{}", self.api_url, relative_path);
                     // ****** END KEY FIX ******
 
                     // Optimization: Group updates by full_url and method
@@ -564,6 +581,18 @@ impl GitHubClient {
         Ok(())
     }
 
+    async fn set_archived(&self, repo: &str, archived: bool, dry_run: bool) -> AppResult<()> {
+        let verb = if archived { "archive" } else { "unarchive" };
+        if dry_run {
+            info!("[Dry Run] Would {} {}/{}", verb, self.org, repo);
+            return Ok(());
+        }
+        let url = format!("{}/repos/{}/{}", self.api_url, self.org, repo);
+        self.send_patch(&url, json!({ ARCHIVED: archived })).await?;
+        info!("{}d {}/{}", verb, self.org, repo);
+        Ok(())
+    }
+
         // Add a helper for DELETE
     async fn send_delete(&self, url: &str) -> AppResult<()> {
         debug!("Attempting to build DELETE request for URL: '{}'", url);
@@ -591,7 +620,7 @@ impl GitHubClient {
 
     // Add a helper to get team members
     async fn get_team_members(&self, team_slug: &str) -> AppResult<HashSet<String>> {
-        let url = format!("https://api.github.com/orgs/{}/teams/{}/members?per_page=100", self.org, team_slug);
+        let url = format!("{}/orgs/{}/teams/{}/members?per_page=100", self.api_url, self.org, team_slug);
         let response = self.get(&url).await?;
         let members_json: Vec<serde_json::Value> = response.json().await.map_err(AppError::Http)?;
         let members = members_json.iter()
@@ -614,7 +643,7 @@ impl GitHubClient {
     /// * `Err(AppError)` if any API call fails.
     ///
     pub async fn create_team(&self, team: &Team, dry_run: bool) -> AppResult<()> {
-        let url_create = format!("https://api.github.com/orgs/{}/teams", self.org); // For POST
+        let url_create = format!("{}/orgs/{}/teams", self.api_url, self.org); // For POST
         let team_slug = &team.name; // Assuming name is slug for now
     
         let existing_team = self.get_team(team_slug).await?;
@@ -631,7 +660,7 @@ impl GitHubClient {
                 let body = json!({"name": team.name, "privacy": "closed"}); // Use team.name for creation
                 self.send_post(&url_create, body).await?;
                 for member in &team.members {
-                    let member_url = format!("https://api.github.com/orgs/{}/teams/{}/memberships/{}", self.org, team_slug, member);
+                    let member_url = format!("{}/orgs/{}/teams/{}/memberships/{}", self.api_url, self.org, team_slug, member);
                     // Use PUT for initial add too, it works as add/update
                     match self.send_put(&member_url, Some(json!({"role": "member"}))).await { // Specify role maybe? GitHub default is member
                         Ok(()) => info!("Added {} to new team {}", member, team_slug),
@@ -650,7 +679,7 @@ impl GitHubClient {
              let members_to_remove = github_members.difference(&config_members);
     
              for member in members_to_add {
-                 let member_url = format!("https://api.github.com/orgs/{}/teams/{}/memberships/{}", self.org, team_slug, member);
+                 let member_url = format!("{}/orgs/{}/teams/{}/memberships/{}", self.api_url, self.org, team_slug, member);
                 if dry_run {
                     info!("[Dry Run] Would add {} to team {}", member, team_slug);
                 } else {
@@ -662,7 +691,7 @@ impl GitHubClient {
              }
     
              for member in members_to_remove {
-                  let member_url = format!("https://api.github.com/orgs/{}/teams/{}/memberships/{}", self.org, team_slug, member);
+                  let member_url = format!("{}/orgs/{}/teams/{}/memberships/{}", self.api_url, self.org, team_slug, member);
                  if dry_run {
                      info!("[Dry Run] Would remove {} from team {}", member, team_slug);
                  } else {
@@ -712,7 +741,7 @@ impl GitHubClient {
         } else {
             let full_url = format!(
                 "{}/orgs/{}/memberships/{}",
-                GITHUB_API_BASE_URL, self.org, user.login
+                self.api_url, self.org, user.login
             );
             let body = json!({
                 "role": user.role
@@ -763,7 +792,7 @@ impl GitHubClient {
         } else {
             let full_url = format!(
                 "{}/orgs/{}/teams/{}/repos/{}/{}",
-                GITHUB_API_BASE_URL, self.org, assignment.team, self.org, assignment.repo
+                self.api_url, self.org, assignment.team, self.org, assignment.repo
             );
             let body = json!({
                 "permission": assignment.permission
@@ -780,7 +809,7 @@ impl GitHubClient {
     async fn get_team_repo_permission(&self, team: &str, repo: &str) -> AppResult<Option<String>> {
         let full_url = format!(
             "{}/orgs/{}/teams/{}/repos/{}/{}",
-            GITHUB_API_BASE_URL, self.org, team, self.org, repo
+            self.api_url, self.org, team, self.org, repo
         );
         match self.get(&full_url).await {
             Ok(response) => {
@@ -859,7 +888,7 @@ impl GitHubClient {
                  if !repo.settings.is_empty() {
                        yaml_content.push_str("  settings:\n");
                        // Example: Write only specific known settings for cleaner output
-                       let keys_to_write = ["allow_merge_commit", "allow_squash_merge", "allow_rebase_merge"];
+                       let keys_to_write = ["allow_merge_commit", "allow_squash_merge", "allow_rebase_merge", ARCHIVED];
                        let mut setting_keys: Vec<_> = repo.settings.keys().collect();
                        setting_keys.sort(); // Sort keys within settings
                        for key in setting_keys {
@@ -947,7 +976,7 @@ impl GitHubClient {
     async fn generate_unfiltered_config_from_org(&self) -> AppResult<Config> {
         // This is essentially the original logic of generate_config_from_org
          let mut repos = Vec::new();
-        let repo_url = format!("https://api.github.com/orgs/{}/repos?per_page=100", self.org);
+        let repo_url = format!("{}/orgs/{}/repos?per_page=100", self.api_url, self.org);
         let repo_response = self.get(&repo_url).await?;
         let repo_json: Vec<serde_json::Value> = repo_response.json().await.map_err(AppError::Http)?;
 
@@ -963,6 +992,10 @@ impl GitHubClient {
                          if let Some(value) = full_settings.get(key) {
                              manageable_settings.insert(key.to_string(), value.clone());
                          }
+                    }
+                    // Only archived repos get the key; like any default, `archived: false` isn't written.
+                    if archived(&full_settings, &name)? == Some(true) {
+                        manageable_settings.insert(ARCHIVED.to_string(), serde_yaml::Value::Bool(true));
                     }
                      manageable_settings
                 }
@@ -996,14 +1029,14 @@ impl GitHubClient {
 
         // Fetch teams, users, assignments as before (full state needed for generation)
         let mut teams = Vec::new();
-        let team_url = format!("https://api.github.com/orgs/{}/teams?per_page=100", self.org);
+        let team_url = format!("{}/orgs/{}/teams?per_page=100", self.api_url, self.org);
         let team_response = self.get(&team_url).await?;
         let team_json: Vec<serde_json::Value> = team_response.json().await.map_err(AppError::Http)?;
 
         for team in team_json {
             // Fetch full team data including members
              let name = team["slug"].as_str().ok_or_else(|| AppError::GitHubApi("Missing team slug".to_string()))?.to_string();
-            let members_url = format!("https://api.github.com/orgs/{}/teams/{}/members?per_page=100", self.org, name);
+            let members_url = format!("{}/orgs/{}/teams/{}/members?per_page=100", self.api_url, self.org, name);
             let members_response = self.get(&members_url).await?;
             let members_json: Vec<serde_json::Value> = members_response.json().await.map_err(AppError::Http)?;
             let mut members = members_json.iter()
@@ -1015,7 +1048,7 @@ impl GitHubClient {
         }
 
         let mut users = Vec::new();
-        let members_url = format!("https://api.github.com/orgs/{}/members?per_page=100", self.org);
+        let members_url = format!("{}/orgs/{}/members?per_page=100", self.api_url, self.org);
         let members_response = self.get(&members_url).await?;
         let members_json: Vec<serde_json::Value> = members_response.json().await.map_err(AppError::Http)?;
 
@@ -1092,7 +1125,10 @@ impl GitHubClient {
              }
         }
 
-        // Sync resources
+        // An archived repo is read-only: unarchive before its other changes, archive after all of them,
+        // and leave a repo that stays archived alone.
+        let mut to_archive = Vec::new();
+        let mut stays_archived = HashSet::new();
         for repo in &config.repos {
             // --- Add logging just before the failing call ---
             info!("Processing repo: {}/{}", self.org, repo.name);
@@ -1103,7 +1139,18 @@ impl GitHubClient {
             // You might add more validation for repo.name characters here if needed
             // --- End logging ---
 
-            self.update_repo_settings(repo, dry_run).await?; // This is the first call in the loop
+            let current = self.get_repo_settings(&repo.name).await?;
+            match (archived(&current, &repo.name)? == Some(true), archived(&repo.settings, &repo.name)?) {
+                (true, Some(false)) => self.set_archived(&repo.name, false, dry_run).await?,
+                (true, _) => {
+                    info!("Skipping {}/{}: it is archived, so its settings, webhook and team access are left as they are. Set `{}: false` to unarchive it.", self.org, repo.name, ARCHIVED);
+                    stays_archived.insert(repo.name.as_str());
+                    continue;
+                }
+                (false, Some(true)) => to_archive.push(repo.name.as_str()),
+                (false, _) => {}
+            }
+            self.update_repo_settings(repo, &current, dry_run).await?;
         }
 
         // Teams
@@ -1119,9 +1166,13 @@ impl GitHubClient {
         }
 
         // Assignments
-        for assignment in &config.assignments {
+        for assignment in config.assignments.iter().filter(|a| !stays_archived.contains(a.repo.as_str())) {
             info!("Processing assignment: Team '{}' on Repo '{}'", assignment.team, assignment.repo); // Add similar logging
             self.assign_team_to_repo(assignment, dry_run).await?;
+        }
+
+        for repo in to_archive {
+            self.set_archived(repo, true, dry_run).await?;
         }
 
         if dry_run {
@@ -1146,6 +1197,13 @@ impl GitHubClient {
         // --- Step 3: Prepare final versions for diffing ---
         let mut diff_local_config = local_config.clone(); // Clone original local config
         let mut diff_github_config = github_config;      // Use the fetched FULL GitHub org state
+
+        // GitHub's side leaves out `archived: false`; where the local config names it, show the real value.
+        for local in diff_local_config.repos.iter().filter(|r| r.settings.contains_key(ARCHIVED)) {
+            if let Some(remote) = diff_github_config.repos.iter_mut().find(|r| r.name == local.name) {
+                remote.settings.entry(ARCHIVED.to_string()).or_insert(serde_yaml::Value::Bool(false));
+            }
+        }
 
         // --- Step 4: Apply local default webhook logic to the local config *copy* ---
         let mut sorted_local_default_webhook = local_default_webhook.clone(); // Clone to sort optional default
@@ -1324,6 +1382,137 @@ mod tests {
             assert_eq!(hook.config.content_type, "json");
             assert_eq!(hook.events, vec!["push", "pull_request"]);
         });
+    }
+
+    /// Mocks the GET side of org `o`: each `(name, archived)` repo with one shared webhook, no teams, no members.
+    async fn mock_org(server: &mut mockito::ServerGuard, repos: &[(&str, bool)]) -> Vec<mockito::Mock> {
+        let list: Vec<_> = repos.iter().map(|(name, _)| json!({"name": name, "private": false})).collect();
+        let mut mocks = vec![
+            server.mock("GET", "/orgs/o/repos?per_page=100").with_body(json!(list).to_string()).create_async().await,
+            server.mock("GET", "/orgs/o/teams?per_page=100").with_body("[]").create_async().await,
+            server.mock("GET", "/orgs/o/members?per_page=100").with_body("[]").create_async().await,
+        ];
+        let hooks = json!([{"id": 1, "url": "u", "config": {"url": "https://hooks.example/h", "content_type": "json"}, "events": ["push"]}]);
+        for (name, archived) in repos {
+            let repo = json!({"name": name, "private": false, "archived": archived,
+                "allow_merge_commit": false, "allow_squash_merge": true, "allow_rebase_merge": true});
+            mocks.push(server.mock("GET", format!("/repos/o/{name}").as_str()).with_body(repo.to_string()).create_async().await);
+            mocks.push(server.mock("GET", format!("/repos/o/{name}/hooks").as_str()).with_body(hooks.to_string()).create_async().await);
+        }
+        mocks
+    }
+
+    fn client(server: &mockito::ServerGuard) -> GitHubClient {
+        let mut client = GitHubClient::new("t", "o");
+        client.api_url = server.url();
+        client
+    }
+
+    fn write_file(text: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        file.write_all(text.as_bytes()).expect("write temp file");
+        file
+    }
+
+    /// The `- name: <repo>` block of a generated config.
+    fn repo_block<'a>(yaml: &'a str, name: &str) -> &'a str {
+        let start = yaml.find(&format!("- name: {name}\n")).expect("repo in output");
+        let rest = &yaml[start + 1..];
+        &yaml[start..start + 1 + rest.find("\n- ").unwrap_or(rest.len())]
+    }
+
+    #[tokio::test]
+    async fn sync_from_org_records_archived_repos_only() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org(&mut server, &[("live", false), ("old", true)]).await;
+        let out = write_file("");
+        let path = out.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("sync-from-org");
+        let yaml = std::fs::read_to_string(path).expect("read output");
+        assert!(repo_block(&yaml, "old").contains("    archived: true\n"), "{yaml}");
+        assert!(!repo_block(&yaml, "live").contains("archived"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn diff_round_trips_archived() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org(&mut server, &[("live", false), ("old", true)]).await;
+        let out = write_file("");
+        let path = out.path().to_str().expect("utf-8 path");
+        let client = client(&server);
+        client.generate_config_and_write(path, false).await.expect("sync-from-org");
+        let generated = std::fs::read_to_string(path).expect("read output");
+        assert!(!client.diff(path).await.expect("diff"), "sync-from-org output differs from the org it came from");
+
+        let live = repo_block(&generated, "live");
+        let explicit = generated.replace(live, &live.replace("    allow_squash_merge: true\n", "    allow_squash_merge: true\n    archived: false\n"));
+        std::fs::write(path, &explicit).expect("write config");
+        assert!(!client.diff(path).await.expect("diff"), "`archived: false` on an unarchived repo is a difference:\n{explicit}");
+
+        std::fs::write(path, generated.replace("    archived: true\n", "    archived: false\n")).expect("write config");
+        assert!(client.diff(path).await.expect("diff"), "an unarchive is not shown as a difference");
+    }
+
+    #[tokio::test]
+    async fn sync_unarchives_first_archives_last_and_leaves_archived_repos_alone() {
+        let mut server = mockito::Server::new_async().await;
+        // kept stays archived, going gets archived, back gets unarchived.
+        let _mocks = mock_org(&mut server, &[("kept", true), ("going", false), ("back", true)]).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut write_mocks = Vec::new();
+        for (method, path) in [
+            ("PATCH", "/repos/o/going"),
+            ("PATCH", "/repos/o/back"),
+            ("PUT", "/orgs/o/teams/devs/repos/o/going"),
+        ] {
+            let writes = writes.clone();
+            let label = format!("{method} {path}");
+            write_mocks.push(
+                server
+                    .mock(method, path)
+                    .with_body_from_request(move |req| {
+                        let body = req.utf8_lossy_body().expect("request body").to_string();
+                        writes.lock().expect("lock").push(format!("{label} {body}"));
+                        b"{}".to_vec()
+                    })
+                    .create_async()
+                    .await,
+            );
+        }
+        // Nothing else is mocked: any write to `kept` gets mockito's 501 and fails the sync.
+        let config = write_file(
+            "org: o
+default_webhook:
+  url: https://hooks.example/h
+  content_type: json
+  events: [push]
+repos:
+- name: kept
+  settings: {allow_merge_commit: true}
+  webhook: {url: https://hooks.example/other, content_type: json, events: [push]}
+- name: going
+  settings: {allow_merge_commit: true, archived: true}
+- name: back
+  settings: {allow_merge_commit: true, archived: false}
+assignments:
+- {repo: going, team: devs, permission: push}
+- {repo: kept, team: devs, permission: push}
+",
+        );
+        client(&server)
+            .sync(config.path().to_str().expect("utf-8 path"), false)
+            .await
+            .expect("sync");
+        assert_eq!(
+            *writes.lock().expect("lock"),
+            [
+                r#"PATCH /repos/o/going {"allow_merge_commit":true}"#,
+                r#"PATCH /repos/o/back {"archived":false}"#,
+                r#"PATCH /repos/o/back {"allow_merge_commit":true}"#,
+                r#"PUT /orgs/o/teams/devs/repos/o/going {"permission":"push"}"#,
+                r#"PATCH /repos/o/going {"archived":true}"#,
+            ]
+        );
     }
 
     #[test]
