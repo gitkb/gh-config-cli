@@ -77,6 +77,9 @@ pub struct Repo {
     pub settings: RepoSettings, // Now extensible
     #[serde(default)]
     pub visibility: Option<String>,
+    /// Whether the repo gets the config's `default_webhook`. Being listed alone connects nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_default_webhook: bool,
     #[serde(default)]
     pub webhook: Option<WebhookConfig>,
     #[serde(default)]
@@ -150,7 +153,7 @@ pub struct Config {
     /// List of team-to-repo assignments.
     #[serde(default)]
     pub assignments: Vec<Assignment>,
-    /// Default webhook configuration for all repositories (if not overridden).
+    /// The webhook of every repo that sets `use_default_webhook`.
     #[serde(default)]
     pub default_webhook: Option<WebhookConfig>,
     /// Default branch protection rules for all repositories (if not overridden).
@@ -177,6 +180,12 @@ impl Config {
         let allowed = crate::api_mapping::repo_settings();
         let all = crate::github_api_mapping_generated::get_github_api_mapping();
         for (i, repo) in config.repos.iter().enumerate() {
+            if repo.use_default_webhook && (repo.webhook.is_some() || config.default_webhook.is_none()) {
+                return Err(crate::error::AppError::Config(format!(
+                    "{main_path}: repos[{i}] (repo {}): `use_default_webhook` needs a top-level `default_webhook` and no `webhook` of its own.",
+                    repo.name
+                )));
+            }
             let Some(key) = repo.settings.keys().find(|k| !allowed.contains_key(k.as_str())) else { continue };
             let problem = match all.get(key.as_str()) {
                 Some(m) => format!("`{key}` is not a repository setting: it would be sent to {} {}, which is not the repo.", m.method, m.endpoint),
@@ -194,6 +203,19 @@ impl Config {
             )));
         }
         Ok(config)
+    }
+
+    /// Gives each repo the webhook it ends up with, events sorted, and drops the default: nothing after this needs it.
+    pub fn resolve_webhooks(&mut self) {
+        let default = self.default_webhook.take();
+        for repo in &mut self.repos {
+            if std::mem::take(&mut repo.use_default_webhook) {
+                repo.webhook = default.clone();
+            }
+            if let Some(webhook) = repo.webhook.as_mut() {
+                webhook.events.sort();
+            }
+        }
     }
 }
 

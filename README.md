@@ -176,7 +176,7 @@ Every command refuses a config with a key it doesn't know before it contacts Git
 ```text
 config.yaml: repos[3].settings (repo old-tool): unknown setting `archive`. Did you mean `archived`? ...
 config.yaml: repos[3].settings (repo old-tool): `default_repository_permission` is not a repository setting: it would be sent to PATCH /orgs/{org}, which is not the repo. ...
-config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `webhook`, `branch_protections`
+config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `use_default_webhook`, `webhook`, `branch_protections`
 ```
 
 **Example `config.yaml`:**
@@ -220,6 +220,31 @@ repos:
 - Team access (`assignments`) is sent for archived repos too, so `sync` applies what `diff` shows. GitHub's docs say an archived repo's permissions are read-only; if GitHub refuses a change, `sync` stops with GitHub's message. Unarchive the repo first (`archived: false`) or change the assignment to match GitHub.
 - `diff` shows archiving and unarchiving as a change to the `archived` line. A repo archived on GitHub whose config leaves `archived` out shows `- archived: true` alone: the config doesn't record it yet (sync-from-org would add it), and `sync` leaves the repo archived.
 
+### Webhooks
+
+A repo gets a webhook only if the config says so: its own `webhook`, or `use_default_webhook: true` for the org's `default_webhook`. Being listed connects nothing, and `sync` never deletes a webhook.
+
+```yaml
+default_webhook:
+  url: https://example.com/hook
+  content_type: json
+  events: [push, pull_request]
+repos:
+  - name: on-the-feed
+    use_default_webhook: true
+  - name: not-on-the-feed
+```
+
+- `sync --dry-run` prints every webhook it would create or update, by repo, whatever `RUST_LOG` says. Each line shows the URL's host, not the whole URL.
+- `sync-from-org` records what GitHub has. It keeps the file's `default_webhook` and sets `use_default_webhook: true` only on repos that have that webhook, so regenerating adds no repo to it. A config holds one webhook per repo, so a repo with several is recorded with its `webhook` from the file if it has that one, else the default, else its first. If the file has no default, the first webhook found becomes it. If a repo's webhooks can't be read, as with a token that can't read hooks, it stays as the file has it and the command names those repos.
+- `diff` never calls webhooks it couldn't read a match: it names those repos and exits 1.
+- A repo opted in but not yet synced has no webhook on GitHub, so regenerating clears its `use_default_webhook`. The same goes for an archived repo, which `sync` skips: run `sync` first, and don't opt in archived repos.
+- To take a repo off the default, delete its webhook on GitHub as well as the key: while the webhook exists, `diff` reports it and `sync-from-org` opts the repo back in.
+- Changing `default_webhook.url` adds a second webhook on each opted-in repo, and the old one keeps delivering until you delete it.
+- A repo with both `use_default_webhook: true` and its own `webhook`, or with no `default_webhook` to use, is refused.
+
+**Upgrading from 1.3.0:** a config with `default_webhook` and no `use_default_webhook` keeps working but connects nothing new. Add the key to each repo that should have the default, or run `sync-from-org` to mark the repos that already have it. That marks every repo holding the webhook, so delete any that shouldn't have it first.
+
 ### Defaults and Merging
 
 You can provide a `defaults.config.yaml` file to specify org-wide or policy defaults. All fields are optional. The main config takes precedence over defaults.
@@ -246,7 +271,7 @@ default_branch_protections:
 
 **Supports:**
 - All GitHub API-manageable settings (see [GitHub REST API docs](https://docs.github.com/en/rest?apiVersion=2022-11-28))
-- Org-wide default webhooks
+- An org-wide default webhook for the repos that opt in
 - Repo settings (merge options, visibility, webhooks, etc.)
 - Teams and members
 - User roles
