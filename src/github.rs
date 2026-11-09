@@ -13,7 +13,8 @@ use crate::config::{Assignment, Repo, RepoSettings, Team, User, WebhookConfig, C
 use crate::error::{AppError, AppResult};
 use colored::*;
 use log::{debug, info, error};
-use reqwest::Client;
+use crate::github_http::GitHubHttp;
+use reqwest::Method;
 use serde_json::json;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet}; // Added HashSet
@@ -102,10 +103,8 @@ pub struct WebhookConfigResponse {
 /// API requests, and high-level orchestration of organization state.
 ///
 pub struct GitHubClient {
-    /// Reqwest HTTP client for making API requests.
-    client: Client,
-    /// GitHub personal access token for authentication.
-    token: String,
+    /// HTTP transport that paces writes and handles rate limits.
+    client: GitHubHttp,
     /// Name of the GitHub organization to operate on.
     pub org: String,
     /// Base URL of the GitHub REST API (tests point it at a mock server).
@@ -120,161 +119,25 @@ impl GitHubClient {
     /// * `org` - Name of the GitHub organization.
     pub fn new(token: &str, org: &str) -> Self {
         GitHubClient {
-            client: Client::new(),
-            token: token.to_string(),
+            client: GitHubHttp::new(token),
             org: org.to_string(),
             api_url: GITHUB_API_BASE_URL.to_string(),
         }
     }
 
     async fn send_patch(&self, url: &str, body: serde_json::Value) -> AppResult<()> {
-        // --- Add Enhanced Logging ---
-        debug!("Attempting to build PATCH request for URL: '{}'", url);
-        if url.trim().is_empty() {
-            error!("URL passed to send_patch() is empty!");
-            return Err(AppError::GitHubApi("Internal error: Attempted PATCH with empty URL".to_string()));
-        }
-        if self.token.trim().is_empty() {
-            error!("GitHub token is empty!");
-            return Err(AppError::GitHubApi("GitHub token is empty".to_string()));
-        } else {
-            debug!("Token length: {}", self.token.len());
-        }
-        debug!("PATCH body: {:?}", body); // Log the body being sent
-        // --- End Enhanced Logging ---
-
-        // Try building step-by-step again
-        let client_ref = &self.client;
-        let builder_result = client_ref.patch(url); // Initial builder
-
-        // --- Log after initial build ---
-        debug!("reqwest::Client::patch succeeded for URL: '{}'", url); // Check if this logs
-        // ---
-
-        let auth_header_value = format!("Bearer {}", self.token);
-        if auth_header_value.contains('\n') || auth_header_value.contains('\r') {
-             error!("Authorization header value contains invalid characters (newline/CR)");
-             return Err(AppError::GitHubApi("Invalid characters in token for Authorization header".to_string()));
-        }
-
-        // Chain headers
-        let request_builder_headers = builder_result
-            .header(reqwest::header::AUTHORIZATION, auth_header_value)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::USER_AGENT, "gh-config");
-
-        // --- Log after headers added ---
-        debug!("Request builder headers configured."); // Check if this logs
-        // ---
-
-        // Add JSON body
-        let request_builder_final = request_builder_headers.json(&body);
-
-        // --- Log after body added ---
-        debug!("Request builder body configured (using .json())."); // Check if this logs
-        // ----
-
-        // Send the request
-        debug!("Attempting final send..."); // Check if this logs
-        let response_result = request_builder_final.send().await; // Store result before unwrapping
-
-        match response_result {
-             Ok(response) => {
-                 // --- Original status check logic ---
-                 debug!("Request send successful."); // Log success before status check
-                 let status = response.status();
-                 debug!("PATCH {} returned status: {}", url, status);
-                 if status.is_success() {
-                     Ok(())
-                 } else {
-                     let text = response.text().await?;
-                     error!("PATCH {} failed with status {}: {}", url, status, text);
-                     Err(AppError::GitHubApi(text))
-                 }
-             }
-             Err(e) => {
-                 error!("Request builder send() failed: {}", e);
-                 // Check if the error source is the builder error we saw
-                 if e.is_builder() {
-                     error!("Confirmed: Failure is a builder error during send().");
-                 } else if e.is_connect() {
-                     error!("Confirmed: Failure is a connection error during send().");
-                 } else if e.is_timeout() {
-                     error!("Confirmed: Failure is a timeout error during send().");
-                 } // Add other checks from reqwest::Error if needed
-                 Err(AppError::from(e)) // Propagate the reqwest error
-             }
-         }
-
+        self.client.request(Method::PATCH, url, "application/vnd.github+json", Some(body)).await?;
+        Ok(())
     }
 
     async fn send_post(&self, url: &str, body: serde_json::Value) -> AppResult<()> {
-        // --- Add Similar Enhanced Logging ---
-        debug!("Attempting to build POST request for URL: '{}'", url);
-        if url.trim().is_empty() { /* ... */ }
-        if self.token.trim().is_empty() { /* ... */ } else { debug!("Token length: {}", self.token.len()); }
-        debug!("POST body: {:?}", body);
-
-        let client_ref = &self.client;
-        let builder_result = client_ref.post(url); // Initial builder
-        debug!("reqwest::Client::post succeeded for URL: '{}'", url);
-
-        let auth_header_value = format!("Bearer {}", self.token);
-        if auth_header_value.contains('\n') || auth_header_value.contains('\r') { /* ... */ }
-
-        let request_builder_headers = builder_result
-            .header(reqwest::header::AUTHORIZATION, auth_header_value)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::USER_AGENT, "gh-config");
-        debug!("Request builder headers configured.");
-
-        let request_builder_final = request_builder_headers.json(&body);
-        debug!("Request builder body configured (using .json()).");
-
-        debug!("Attempting final send...");
-        let response_result = request_builder_final.send().await; // Store result
-
-        match response_result {
-            Ok(response) => {
-                debug!("Request send successful.");
-                let status = response.status();
-                debug!("POST {} returned status: {}", url, status);
-                if status.is_success() {
-                    Ok(())
-                } else {
-                    let text = response.text().await?;
-                    error!("POST {} failed with status {}: {}", url, status, text);
-                    Err(AppError::GitHubApi(text))
-                }
-            }
-            Err(e) => {
-                error!("Request builder send() failed: {}", e);
-                if e.is_builder() { error!("Confirmed: Failure is a builder error during send()."); }
-                // ... other error checks ...
-                Err(AppError::from(e))
-            }
-        }
+        self.client.request(Method::POST, url, "application/vnd.github+json", Some(body)).await?;
+        Ok(())
     }
 
     async fn send_put(&self, url: &str, body: Option<serde_json::Value>) -> AppResult<()> {
-        let mut request = self
-            .client
-            .put(url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "gh-config");
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send().await?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            let status = response.status();
-            let text = response.text().await?;
-            error!("PUT {} failed with status {}: {}", url, status, text);
-            Err(AppError::GitHubApi(text))
-        }
+        self.client.request(Method::PUT, url, "application/vnd.github+json", body).await?;
+        Ok(())
     }
 
     async fn get(&self, url: &str) -> AppResult<reqwest::Response> {
@@ -283,60 +146,7 @@ impl GitHubClient {
 
     /// A GET that asks for the `accept` media type.
     async fn get_as(&self, url: &str, accept: &str) -> AppResult<reqwest::Response> {
-        // --- Add Enhanced Logging ---
-        debug!("Attempting to build GET request for URL: '{}'", url);
-        if url.trim().is_empty() {
-             error!("URL passed to get() is empty!");
-             return Err(AppError::GitHubApi("Internal error: Attempted GET with empty URL".to_string()));
-        }
-        // Check token validity superficially (e.g., not empty)
-        if self.token.trim().is_empty() {
-            error!("GitHub token is empty!");
-            // Although this usually causes 401 later, an empty Bearer token might fail earlier.
-            return Err(AppError::GitHubApi("GitHub token is empty".to_string()));
-        } else {
-             // Log length as a non-sensitive indicator
-             debug!("Token length: {}", self.token.len());
-        }
-        // --- End Enhanced Logging ---
-
-        // Try building the request step-by-step to isolate the failure
-        let client_ref = &self.client; // Borrow client
-        let builder_result = client_ref.get(url); // Create builder
-
-        // --- Log after potential URL parsing failure ---
-        debug!("reqwest::Client::get succeeded for URL: '{}'", url);
-        // ---
-
-        let auth_header_value = format!("Bearer {}", self.token);
-        // Validate auth header value doesn't contain obviously invalid chars like newline
-        if auth_header_value.contains('\n') || auth_header_value.contains('\r') {
-             error!("Authorization header value contains invalid characters (newline/CR)");
-             return Err(AppError::GitHubApi("Invalid characters in token for Authorization header".to_string()));
-        }
-
-        // Chain the rest - if it fails here, it's likely header related
-        let request_builder = builder_result
-            .header(reqwest::header::AUTHORIZATION, auth_header_value) // Use constant for clarity
-            .header(reqwest::header::ACCEPT, accept)
-            .header(reqwest::header::USER_AGENT, "gh-config");
-
-        // --- Log before send ---
-        debug!("Request builder fully configured, attempting send...");
-        // ---
-
-        let response = request_builder.send().await?;
-
-        // --- Original status check logic ---
-        let status = response.status();
-        debug!("GET {} returned status: {}", url, status);
-        if status.is_success() {
-            Ok(response)
-        } else {
-            let text = response.text().await?;
-            error!("GET {} failed with status {}: {}", url, status, text);
-            Err(AppError::GitHubApi(text))
-        }
+        self.client.request(Method::GET, url, accept, None).await
     }
 
     /// Every item of a GitHub list, following `Link: rel="next"` from page to page.
@@ -412,7 +222,7 @@ impl GitHubClient {
                     Ok(None)
                 }
             }
-            Err(AppError::GitHubApi(e)) if e.contains("404") => Ok(None),
+            Err(AppError::GitHubResponse { status: reqwest::StatusCode::NOT_FOUND, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -430,7 +240,7 @@ impl GitHubClient {
                     .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", full_url, e)))?;
                 Ok(Some(membership.role))
             }
-            Err(AppError::GitHubApi(e)) if e.contains("404") => Ok(None),
+            Err(AppError::GitHubResponse { status: reqwest::StatusCode::NOT_FOUND, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -625,29 +435,9 @@ impl GitHubClient {
         Ok(())
     }
 
-        // Add a helper for DELETE
     async fn send_delete(&self, url: &str) -> AppResult<()> {
-        debug!("Attempting to build DELETE request for URL: '{}'", url);
-        // Add token/URL checks if desired
-        let response = self
-            .client
-            .delete(url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::USER_AGENT, "gh-config")
-            .send()
-            .await?;
-
-        let status = response.status();
-        debug!("DELETE {} returned status: {}", url, status);
-        // DELETE for membership returns 204 No Content on success
-        if status.is_success() || status == reqwest::StatusCode::NO_CONTENT {
-            Ok(())
-        } else {
-            let text = response.text().await?;
-            error!("DELETE {} failed with status {}: {}", url, status, text);
-            Err(AppError::GitHubApi(text))
-        }
+        self.client.request(Method::DELETE, url, "application/vnd.github+json", None).await?;
+        Ok(())
     }
 
     // Add a helper to get team members
@@ -751,8 +541,12 @@ impl GitHubClient {
     /// * `Err(AppError)` if any API call fails.
     ///
     pub async fn add_user_to_org(&self, user: &User, dry_run: bool) -> AppResult<()> {
+        let current_role = self.get_user_membership(&user.login).await?;
+        if current_role.as_deref() == Some(user.role.as_str()) {
+            debug!("No changes needed for user {}", user.login);
+            return Ok(());
+        }
         if dry_run {
-            let current_role = self.get_user_membership(&user.login).await?;
             match current_role {
                 Some(role) if role != user.role => {
                     info!(
@@ -794,10 +588,12 @@ impl GitHubClient {
     /// * `Err(AppError)` if any API call fails.
     ///
     pub async fn assign_team_to_repo(&self, assignment: &Assignment, dry_run: bool) -> AppResult<()> {
+        let current_perm = self.get_team_repo_permission(&assignment.team, &assignment.repo).await?;
+        if current_perm.as_deref() == Some(assignment.permission.as_str()) {
+            debug!("No changes needed for team {} on {}/{}", assignment.team, self.org, assignment.repo);
+            return Ok(());
+        }
         if dry_run {
-            let current_perm = self
-                .get_team_repo_permission(&assignment.team, &assignment.repo)
-                .await?;
             match current_perm {
                 Some(perm) if perm != assignment.permission => {
                     info!(
@@ -850,7 +646,7 @@ impl GitHubClient {
                     .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", full_url, e)))?;
                 Ok(perms.permissions.level().map(String::from))
             }
-            Err(AppError::GitHubApi(e)) if e.contains("404") => Ok(None),
+            Err(AppError::GitHubResponse { status: reqwest::StatusCode::NOT_FOUND, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1329,7 +1125,6 @@ mod tests {
     #[tokio::test]
     async fn test_github_client_new() {
         let client = GitHubClient::new("dummy_token", "dummy_org");
-        assert_eq!(client.token, "dummy_token");
         assert_eq!(client.org, "dummy_org");
     }
 
@@ -1796,6 +1591,74 @@ assignments:
                 r#"PATCH /repos/o/going {"archived":true}"#,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn matching_memberships_and_assignments_do_not_write() {
+        let mut server = mockito::Server::new_async().await;
+        let membership = server.mock("GET", "/orgs/o/memberships/alice")
+            .with_body(r#"{"role":"admin"}"#).expect(2).create_async().await;
+        let permission = server.mock("GET", "/orgs/o/teams/devs/repos/o/r")
+            .match_header("accept", "application/vnd.github.v3.repository+json")
+            .with_body(r#"{"name":"r","permissions":{"pull":true,"push":true,"admin":false}}"#)
+            .expect(2).create_async().await;
+        let writes = server.mock("PUT", mockito::Matcher::Any).expect(0).create_async().await;
+        let client = client(&server);
+        let user = User { login: "alice".into(), role: "admin".into() };
+        let assignment = Assignment { repo: "r".into(), team: "devs".into(), permission: "push".into() };
+        for dry_run in [true, false] {
+            client.add_user_to_org(&user, dry_run).await.expect("membership");
+            client.assign_team_to_repo(&assignment, dry_run).await.expect("assignment");
+        }
+        membership.assert_async().await;
+        permission.assert_async().await;
+        writes.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn missing_or_changed_roles_and_permissions_are_applied_but_not_by_dry_runs() {
+        for missing in [false, true] {
+            let mut server = mockito::Server::new_async().await;
+            let status = if missing { 404 } else { 200 };
+            // GitHub's Not Found response need not repeat the numeric status in its body.
+            let membership = server.mock("GET", "/orgs/o/memberships/alice").with_status(status)
+                .with_body(if missing { r#"{"message":"Not Found"}"# } else { r#"{"role":"member"}"# })
+                .expect(2).create_async().await;
+            let permission = server.mock("GET", "/orgs/o/teams/devs/repos/o/r").with_status(status)
+                .with_body(if missing { r#"{"message":"Not Found"}"# } else { r#"{"name":"r","permissions":{"pull":true,"push":false,"admin":false}}"# })
+                .expect(2).create_async().await;
+            let role_write = server.mock("PUT", "/orgs/o/memberships/alice")
+                .match_body(mockito::Matcher::Json(json!({"role":"admin"})))
+                .with_status(200).expect(1).create_async().await;
+            let permission_write = server.mock("PUT", "/orgs/o/teams/devs/repos/o/r")
+                .match_body(mockito::Matcher::Json(json!({"permission":"push"})))
+                .with_status(204).expect(1).create_async().await;
+            let client = client(&server);
+            let user = User { login: "alice".into(), role: "admin".into() };
+            let assignment = Assignment { repo: "r".into(), team: "devs".into(), permission: "push".into() };
+            client.add_user_to_org(&user, true).await.expect("dry membership");
+            client.assign_team_to_repo(&assignment, true).await.expect("dry assignment");
+            assert!(!role_write.matched_async().await && !permission_write.matched_async().await, "dry run wrote");
+            client.add_user_to_org(&user, false).await.expect("membership");
+            client.assign_team_to_repo(&assignment, false).await.expect("assignment");
+            for mock in [membership, permission, role_write, permission_write] {
+                mock.assert_async().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_reads_that_fail_do_not_trigger_writes() {
+        let mut server = mockito::Server::new_async().await;
+        let _membership = server.mock("GET", "/orgs/o/memberships/alice404").with_status(403)
+            .with_body(r#"{"message":"Resource not accessible by integration"}"#).create_async().await;
+        let _permission = server.mock("GET", "/orgs/o/teams/devs/repos/o/r404").with_status(403)
+            .with_body(r#"{"message":"Resource not accessible by integration"}"#).create_async().await;
+        let writes = server.mock("PUT", mockito::Matcher::Any).expect(0).create_async().await;
+        let client = client(&server);
+        assert!(client.add_user_to_org(&User { login: "alice404".into(), role: "admin".into() }, false).await.is_err());
+        assert!(client.assign_team_to_repo(&Assignment { repo: "r404".into(), team: "devs".into(), permission: "push".into() }, false).await.is_err());
+        writes.assert_async().await;
     }
 
     #[test]

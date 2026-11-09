@@ -7,6 +7,8 @@ pub enum AppError {
     Config(String),
     #[error("GitHub API error: {0}")]
     GitHubApi(String),
+    #[error("GitHub API error: {message}")]
+    GitHubResponse { status: reqwest::StatusCode, message: String },
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("HTTP error: {0}")]
