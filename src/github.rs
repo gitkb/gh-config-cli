@@ -222,7 +222,7 @@ impl GitHubClient {
                     Ok(None)
                 }
             }
-            Err(AppError::GitHubApi(e)) if e.contains("404") => Ok(None),
+            Err(AppError::GitHubResponse { status: reqwest::StatusCode::NOT_FOUND, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -240,7 +240,7 @@ impl GitHubClient {
                     .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", full_url, e)))?;
                 Ok(Some(membership.role))
             }
-            Err(AppError::GitHubApi(e)) if e.contains("404") => Ok(None),
+            Err(AppError::GitHubResponse { status: reqwest::StatusCode::NOT_FOUND, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -646,7 +646,7 @@ impl GitHubClient {
                     .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", full_url, e)))?;
                 Ok(perms.permissions.level().map(String::from))
             }
-            Err(AppError::GitHubApi(e)) if e.contains("404") => Ok(None),
+            Err(AppError::GitHubResponse { status: reqwest::StatusCode::NOT_FOUND, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1650,14 +1650,14 @@ assignments:
     #[tokio::test]
     async fn permission_reads_that_fail_do_not_trigger_writes() {
         let mut server = mockito::Server::new_async().await;
-        let _membership = server.mock("GET", "/orgs/o/memberships/alice").with_status(403)
+        let _membership = server.mock("GET", "/orgs/o/memberships/alice404").with_status(403)
             .with_body(r#"{"message":"Resource not accessible by integration"}"#).create_async().await;
-        let _permission = server.mock("GET", "/orgs/o/teams/devs/repos/o/r").with_status(403)
+        let _permission = server.mock("GET", "/orgs/o/teams/devs/repos/o/r404").with_status(403)
             .with_body(r#"{"message":"Resource not accessible by integration"}"#).create_async().await;
         let writes = server.mock("PUT", mockito::Matcher::Any).expect(0).create_async().await;
         let client = client(&server);
-        assert!(client.add_user_to_org(&User { login: "alice".into(), role: "admin".into() }, false).await.is_err());
-        assert!(client.assign_team_to_repo(&Assignment { repo: "r".into(), team: "devs".into(), permission: "push".into() }, false).await.is_err());
+        assert!(client.add_user_to_org(&User { login: "alice404".into(), role: "admin".into() }, false).await.is_err());
+        assert!(client.assign_team_to_repo(&Assignment { repo: "r404".into(), team: "devs".into(), permission: "push".into() }, false).await.is_err());
         writes.assert_async().await;
     }
 

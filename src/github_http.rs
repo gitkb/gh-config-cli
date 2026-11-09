@@ -95,9 +95,10 @@ impl GitHubHttp {
             } else {
                 ""
             };
-            return Err(AppError::GitHubApi(format!(
-                "{method} {url} failed with {status}{exhausted}: {text}"
-            )));
+            return Err(AppError::GitHubResponse {
+                status,
+                message: format!("{method} {url} failed with {status}{exhausted}: {text}"),
+            });
         }
         Err(AppError::GitHubApi(
             "Rate-limit retry budget exhausted".into(),
