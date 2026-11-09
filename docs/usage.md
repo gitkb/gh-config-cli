@@ -2,6 +2,13 @@
 
 This guide provides detailed instructions and examples for using `gh-config-cli` to manage your GitHub organization.
 
+Organization sync reads current roles and team permissions before applying
+changes, so matching values cause no writes. All organization API calls are
+serialized, with at least one second between writes. Rate-limited responses
+are retried up to three times using `Retry-After`, the primary rate-limit reset
+time, or waits of 60, 120 and 240 seconds when neither is available. Other
+authorization failures stop immediately; exhausted retries return an error.
+
 ---
 
 ## Available Commands
