@@ -84,6 +84,10 @@ pub struct Repo {
     pub webhook: Option<WebhookConfig>,
     #[serde(default)]
     pub branch_protections: Vec<BranchProtectionRule>,
+    /// Status checks that must pass before a PR merges to the default branch, held in the repo's
+    /// `Require CI` ruleset. Empty: `sync` leaves the repo's rulesets alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_checks: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)] // Added Clone

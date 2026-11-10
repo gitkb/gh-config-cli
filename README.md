@@ -176,7 +176,7 @@ Every command refuses a config with a key it doesn't know before it contacts Git
 ```text
 config.yaml: repos[3].settings (repo old-tool): unknown setting `archive`. Did you mean `archived`? ...
 config.yaml: repos[3].settings (repo old-tool): `default_repository_permission` is not a repository setting: it would be sent to PATCH /orgs/{org}, which is not the repo. ...
-config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `use_default_webhook`, `webhook`, `branch_protections`
+config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `use_default_webhook`, `webhook`, `branch_protections`, `required_checks`
 ```
 
 **Example `config.yaml`:**
@@ -219,6 +219,37 @@ repos:
 - A repo that is archived on GitHub and has no `archived: false` keeps its settings and webhook: `sync` leaves them as they are and logs one line saying so (shown with `RUST_LOG=info`, like its other per-change lines). Leaving `archived` out never unarchives a repo.
 - Team access (`assignments`) is sent for archived repos too, so `sync` applies what `diff` shows. GitHub's docs say an archived repo's permissions are read-only; if GitHub refuses a change, `sync` stops with GitHub's message. Unarchive the repo first (`archived: false`) or change the assignment to match GitHub.
 - `diff` shows archiving and unarchiving as a change to the `archived` line. A repo archived on GitHub whose config leaves `archived` out shows `- archived: true` alone: the config doesn't record it yet (sync-from-org would add it), and `sync` leaves the repo archived.
+
+### Creating repos
+
+`sync` creates a repo the config lists and GitHub doesn't have, with the config's `visibility`, then applies its settings, rulesets and team access. A missing repo without `visibility` is refused rather than guessed. `sync --dry-run` prints `Would create` and skips the rest of that repo, since there is nothing to read yet.
+
+### Auto-merge and Actions access
+
+```yaml
+repos:
+  - name: service
+    visibility: private
+    settings:
+      allow_auto_merge: true        # PRs may merge themselves once their required checks pass
+      access_level: organization    # other private repos in the org may call this repo's reusable workflows
+```
+
+- Like `archived`, `sync-from-org` writes `allow_auto_merge: true` and an `access_level` other than `none` only when GitHub has them; `diff` treats `allow_auto_merge: false` and `access_level: none` in a config as GitHub's defaults, not differences.
+- `access_level` (GitHub's `/actions/permissions/access`) exists only for private repos. `sync` reads it only for repos whose config names it, and writes it only when it differs. `sync-from-org` and `diff` read it for every private repo: one extra request each.
+
+### Required checks
+
+```yaml
+repos:
+  - name: service
+    required_checks: [Format, Unit Tests, "Clippy & Docs"]
+```
+
+- `sync` keeps them in the repo's own ruleset named `Require CI`: active, on the default branch (`~DEFAULT_BRANCH`), not strict (a PR needn't be up to date with the branch), one `required_status_checks` rule. It creates the ruleset if the repo has none by that name and rewrites it when its checks (in any order) or any of those properties differ. An existing `Require CI` ruleset is adopted by name.
+- gh-config owns every rule in `Require CI`: if it holds any other rule, `sync` stops with an error naming the repo and the rule instead of dropping it. Keep other rules in other rulesets.
+- A repo with no `required_checks` is left alone: `sync` doesn't read or delete its rulesets. To stop requiring checks, delete the ruleset on GitHub and the key.
+- `sync-from-org` records the checks of each repo's `Require CI` ruleset, in the file's order when the file names the same ones; `diff` compares them as a set. It costs one rulesets request per repo, plus one when `Require CI` exists. A ruleset that can't be read keeps what the file has, and `diff` names the repo and exits 1. Properties other than the checks aren't recorded, so `diff` shows no change when only those differ; `sync` still corrects them.
 
 ### Webhooks
 

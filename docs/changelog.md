@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- `sync` creates repos the config lists and GitHub doesn't have, with their `visibility`.
+- `sync-from-org` and `diff` record `allow_auto_merge` and private repos' Actions `access_level`, so the drift check keeps them; `sync` reads `access_level` before writing it.
+- New repo field `required_checks`, kept in the repo ruleset `Require CI`.
+
 ## [v1.3.2] - 2026-11-09
 
 - Skip organization membership and team permission writes when the configured values already match GitHub.
