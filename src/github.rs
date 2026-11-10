@@ -17,7 +17,7 @@ use crate::github_http::GitHubHttp;
 use reqwest::Method;
 use serde_json::json;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::{HashMap, HashSet}; // Added HashSet
+use std::collections::HashSet;
 use similar::{ChangeTag, TextDiff};
 use std::fs::File;
 use std::io::Write;
@@ -43,17 +43,36 @@ fn omitted_defaults() -> [(&'static str, serde_yaml::Value); 3] {
     ]
 }
 
+/// One required status check. `integration_id`, when GitHub has one, pins the check to the app that must post it.
+#[derive(Debug, Clone, PartialEq)]
+struct RequiredCheck {
+    context: String,
+    integration_id: Option<u64>,
+}
+
 /// A repo's `Require CI` ruleset as GitHub holds it.
 struct RequireCi {
     id: u64,
-    checks: Vec<String>,
+    checks: Vec<RequiredCheck>,
     /// Whether everything but the checks is what `sync` writes: active, on the default branch, not strict.
     standard: bool,
 }
 
+impl RequireCi {
+    fn contexts(&self) -> Vec<String> {
+        self.checks.iter().map(|c| c.context.clone()).collect()
+    }
+}
+
 /// The `Require CI` ruleset `sync` writes for `checks`.
-fn require_ci_body(checks: &[String]) -> serde_json::Value {
-    let checks: Vec<_> = checks.iter().map(|c| json!({ "context": c })).collect();
+fn require_ci_body(checks: &[RequiredCheck]) -> serde_json::Value {
+    let checks: Vec<_> = checks
+        .iter()
+        .map(|c| match c.integration_id {
+            Some(id) => json!({ "context": c.context, "integration_id": id }),
+            None => json!({ "context": c.context }),
+        })
+        .collect();
     json!({
         "name": REQUIRE_CI,
         "target": "branch",
@@ -82,7 +101,15 @@ fn parse_require_ci(repo: &str, ruleset: &serde_json::Value) -> AppResult<Requir
     let params = rules.first().map(|r| &r["parameters"]);
     let checks = params
         .and_then(|p| p["required_status_checks"].as_array())
-        .map(|checks| checks.iter().filter_map(|c| c["context"].as_str().map(String::from)).collect())
+        .map(|checks| {
+            checks
+                .iter()
+                .filter_map(|c| {
+                    let context = c["context"].as_str()?.to_string();
+                    Some(RequiredCheck { context, integration_id: c["integration_id"].as_u64() })
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let ref_name = &ruleset["conditions"]["ref_name"];
     let standard = rules.len() == 1
@@ -107,6 +134,29 @@ fn same_checks(a: &[String], b: &[String]) -> bool {
 struct RulesetSummary {
     id: u64,
     name: String,
+}
+
+/// The visibility the config gives a repo: `settings.visibility`, which `sync` writes, else `visibility`.
+/// Config loading has refused the two disagreeing.
+fn config_visibility(repo: &Repo) -> Option<&str> {
+    repo.settings.get("visibility").and_then(|v| v.as_str()).or(repo.visibility.as_deref())
+}
+
+/// Whether an `access_level` asks for more than `none`, the only level a public repo can have.
+fn grants_access(repo: &Repo) -> bool {
+    repo.settings.get(ACCESS_LEVEL).is_some_and(|v| v.as_str() != Some("none"))
+}
+
+/// Rejects, before anything reads or writes GitHub (dry runs included), an `access_level` other than `none` on a
+/// repo the config makes public: GitHub has no access level for public repos.
+fn check_access_levels(config: &Config) -> AppResult<()> {
+    match config.repos.iter().find(|r| config_visibility(r) == Some("public") && grants_access(r)) {
+        Some(repo) => Err(AppError::Config(format!(
+            "Repo {}: `{ACCESS_LEVEL}` other than `none` applies only to private repos, and the config makes it public.",
+            repo.name
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Rejects a config whose `archived` values aren't booleans, before anything reads or writes GitHub.
@@ -336,17 +386,26 @@ impl GitHubClient {
         if checks.is_empty() {
             return Ok(());
         }
-        let (method, url) = match self.read_require_ci(&repo.name).await? {
-            Some(current) if current.standard && same_checks(&current.checks, checks) => return Ok(()),
+        let current = self.read_require_ci(&repo.name).await?;
+        let held = current.as_ref().map(|c| c.checks.clone()).unwrap_or_default();
+        // A check kept from the ruleset keeps the app it's pinned to; a new one has none.
+        let desired: Vec<RequiredCheck> = checks
+            .iter()
+            .map(|name| held.iter().find(|c| &c.context == name).cloned().unwrap_or(RequiredCheck { context: name.clone(), integration_id: None }))
+            .collect();
+        let (method, url) = match current {
+            Some(current) if current.standard && same_checks(&current.contexts(), checks) => return Ok(()),
             Some(current) => (Method::PUT, format!("{}/repos/{}/{}/rulesets/{}", self.api_url, self.org, repo.name, current.id)),
             None => (Method::POST, format!("{}/repos/{}/{}/rulesets", self.api_url, self.org, repo.name)),
         };
         let verb = if method == Method::POST { "create" } else { "update" };
         if dry_run {
-            println!("[Dry Run] Would {verb} ruleset `{REQUIRE_CI}` on {}/{} requiring: {}", self.org, repo.name, checks.join(", "));
+            let removed: Vec<_> = held.iter().map(|c| c.context.as_str()).filter(|c| !checks.iter().any(|n| n == c)).collect();
+            let removed = if removed.is_empty() { String::new() } else { format!("; no longer requiring: {}", removed.join(", ")) };
+            println!("[Dry Run] Would {verb} ruleset `{REQUIRE_CI}` on {}/{} requiring: {}{removed}", self.org, repo.name, checks.join(", "));
             return Ok(());
         }
-        self.client.request(method, &url, "application/vnd.github+json", Some(require_ci_body(checks))).await?;
+        self.client.request(method, &url, "application/vnd.github+json", Some(require_ci_body(&desired))).await?;
         info!("Ruleset `{REQUIRE_CI}` on {}/{} now requires: {}", self.org, repo.name, checks.join(", "));
         Ok(())
     }
@@ -494,17 +553,19 @@ impl GitHubClient {
     /// - Also manages webhooks if defined in the repo configuration.
     ///
     /// `archived` is skipped here: `sync` unarchives before and archives after everything else.
-    pub async fn update_repo_settings(&self, repo: &Repo, current: &RepoSettings, dry_run: bool) -> AppResult<()> {
+    /// Writes the settings `only` accepts that differ from `current`. Writes go out in URL order, so the repo's own
+    /// PATCH (visibility included) comes before anything under it, such as the Actions access level.
+    pub async fn update_repo_settings(&self, repo: &Repo, current: &RepoSettings, only: impl Fn(&str) -> bool, dry_run: bool) -> AppResult<()> {
         let desired = &repo.settings;
         let mapping = crate::api_mapping::repo_settings();
 
         // --- Optimization suggestion (Apply after fixing URL): ---
         // Instead of sending one PATCH per setting, collect all PATCHes for the same endpoint.
         // Create a HashMap<String, serde_json::Map<String, serde_json::Value>> where the key is the endpoint URL.
-        let mut pending_updates: HashMap<String, (String, serde_json::Map<String, serde_json::Value>)> = HashMap::new();
+        let mut pending_updates: std::collections::BTreeMap<String, (String, serde_json::Map<String, serde_json::Value>)> = Default::default();
         // The tuple stores (HTTP Method, Body Map)
 
-        for (k, v_desired) in desired.iter().filter(|(k, _)| k.as_str() != ARCHIVED) {
+        for (k, v_desired) in desired.iter().filter(|(k, _)| k.as_str() != ARCHIVED && only(k)) {
             if let Some(field_map) = mapping.get(k.as_str()) {
                 let v_current = current.get(k);
                 if v_current != Some(v_desired) {
@@ -559,12 +620,6 @@ impl GitHubClient {
              }
         }
 
-
-        // If a webhook is defined in the repo config, manage it as well.
-        // Ensure manage_webhooks also uses full URLs if it calls send_* methods directly.
-         if let Some(webhook) = repo.webhook.as_ref() {
-             self.manage_webhooks(&repo.name, webhook, dry_run).await?;
-         }
 
         Ok(())
     }
@@ -1025,7 +1080,7 @@ impl GitHubClient {
             let file_checks = in_file.map(|r| r.required_checks.clone()).unwrap_or_default();
             let required_checks = match self.read_require_ci(&name).await {
                 // The file's order when it names the same checks, so regenerating doesn't reorder them.
-                Ok(found) => match found.map(|r| r.checks).unwrap_or_default() {
+                Ok(found) => match found.map(|r| r.contexts()).unwrap_or_default() {
                     checks if same_checks(&checks, &file_checks) => file_checks,
                     checks => checks,
                 },
@@ -1102,6 +1157,7 @@ impl GitHubClient {
         let config = crate::config::Config::from_file_with_defaults(config_path, None)?;
         self.org = config.org.clone(); // Set org from config
         check_archived(&config)?;
+        check_access_levels(&config)?;
 
         if dry_run {
             info!("Running in dry-run mode; validating changes without applying.");
@@ -1137,14 +1193,19 @@ impl GitHubClient {
                 }
                 Err(e) => return Err(e),
             };
-            // Read only when the config names it, so it's written only when it differs. Public repos have none.
-            if repo.settings.contains_key(ACCESS_LEVEL) {
-                if current.get("visibility").and_then(|v| v.as_str()) == Some("public") {
-                    return Err(AppError::Config(format!(
-                        "Repo {}: `{ACCESS_LEVEL}` applies only to private repos, and {}/{} is public.",
-                        repo.name, self.org, repo.name
-                    )));
-                }
+            // The access level exists only on private repos. Read it only when the config names it, so it's written
+            // only when it differs. A repo the config makes private now has none to read: it's written after the
+            // visibility PATCH (URL order, see `update_repo_settings`).
+            let now_public = current.get("visibility").and_then(|v| v.as_str()) == Some("public");
+            let ends_public = config_visibility(repo).map_or(now_public, |v| v == "public");
+            if ends_public && grants_access(repo) {
+                // Only reachable when the config leaves visibility to GitHub: the rest was refused up front.
+                return Err(AppError::Config(format!(
+                    "Repo {}: `{ACCESS_LEVEL}` other than `none` applies only to private repos, and {}/{} is public.",
+                    repo.name, self.org, repo.name
+                )));
+            }
+            if repo.settings.contains_key(ACCESS_LEVEL) && !now_public {
                 let level = self.get_access_level(&repo.name).await?;
                 current.insert(ACCESS_LEVEL.to_string(), serde_yaml::Value::String(level));
             }
@@ -1158,8 +1219,15 @@ impl GitHubClient {
                 (false, Some(true)) => to_archive.push(repo.name.as_str()),
                 (false, _) => {}
             }
-            self.update_repo_settings(repo, &current, dry_run).await?;
+            // Auto-merge goes on only after the ruleset that gates it, so a failed ruleset write never leaves PRs
+            // merging with no checks. A public repo's `access_level: none` has nothing to write.
+            let skip_access = ends_public;
+            self.update_repo_settings(repo, &current, |k| k != ALLOW_AUTO_MERGE && !(skip_access && k == ACCESS_LEVEL), dry_run).await?;
+            if let Some(webhook) = repo.webhook.as_ref() {
+                self.manage_webhooks(&repo.name, webhook, dry_run).await?;
+            }
             self.sync_required_checks(repo, dry_run).await?;
+            self.update_repo_settings(repo, &current, |k| k == ALLOW_AUTO_MERGE, dry_run).await?;
         }
 
         // Teams
@@ -1449,10 +1517,14 @@ mod tests {
         mocks
     }
 
+    /// `checks` pinned to no app.
+    fn unpinned(checks: &[&str]) -> Vec<RequiredCheck> {
+        checks.iter().map(|c| RequiredCheck { context: c.to_string(), integration_id: None }).collect()
+    }
+
     /// A `Require CI` ruleset with id `id` requiring `checks`, as `sync` writes it.
     fn require_ci(id: u64, checks: &[&str]) -> serde_json::Value {
-        let checks: Vec<String> = checks.iter().map(|c| c.to_string()).collect();
-        let mut ruleset = require_ci_body(&checks);
+        let mut ruleset = require_ci_body(&unpinned(checks));
         ruleset["id"] = json!(id);
         ruleset
     }
@@ -1953,9 +2025,10 @@ assignments:
         client(&server).sync(config.path().to_str().expect("utf-8 path"), false).await.expect("sync");
         assert_eq!(*writes.lock().expect("lock"), [r#"PUT /repos/o/closed/actions/permissions/access {"access_level":"organization"}"#]);
 
-        // Neither is taken for a missing repo (no create is mocked), and nothing is written.
-        for (repo, says) in [("broken", "access level"), ("pub", "public")] {
-            let config = write_file(&format!("org: o\nrepos:\n- name: {repo}\n  visibility: private\n  settings: {{access_level: organization}}\n"));
+        // Neither is taken for a missing repo (no create is mocked), and nothing is written. `pub` stays public:
+        // its config leaves visibility to GitHub.
+        for (repo, visibility, says) in [("broken", "\n  visibility: private", "access level"), ("pub", "", "public")] {
+            let config = write_file(&format!("org: o\nrepos:\n- name: {repo}{visibility}\n  settings: {{access_level: organization}}\n"));
             let err = client(&server).sync(config.path().to_str().expect("utf-8 path"), true).await.expect_err("accepted");
             assert!(err.to_string().contains(repo) && err.to_string().contains(says), "{err}");
         }
@@ -2002,7 +2075,7 @@ assignments:
         client(&server).sync(path, true).await.expect("dry run");
         assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
         client(&server).sync(path, false).await.expect("sync");
-        let body = |checks: &[&str]| require_ci_body(&checks.iter().map(|c| c.to_string()).collect::<Vec<_>>()).to_string();
+        let body = |checks: &[&str]| require_ci_body(&unpinned(checks)).to_string();
         assert_eq!(
             *writes.lock().expect("lock"),
             [format!("POST /repos/o/fresh/rulesets {}", body(&["A", "Clippy & Docs"])), format!("PUT /repos/o/adopt/rulesets/7 {}", body(&["A", "B"]))]
@@ -2031,6 +2104,119 @@ assignments:
         assert!(!client.diff(path).await.expect("diff"), "sync-from-org output differs from the org it came from:\n{generated}");
         std::fs::write(path, generated.replace("  - A\n", "")).expect("write config");
         assert!(client.diff(path).await.expect("diff"), "a removed check is not shown");
+    }
+
+
+    #[tokio::test]
+    async fn visibility_changes_are_checked_up_front_and_ordered_before_the_access_level() {
+        let mut server = mockito::Server::new_async().await;
+        let private = json!({"private": true, "visibility": "private", ACCESS_LEVEL: "organization"});
+        // `opening` is public, so it has no access level to read: none is mocked.
+        let _mocks = mock_org_full(&mut server, &[("opening", json!({})), ("closing", private)], |_| json!([]), |_| Some(vec![])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _patch = record(&mut server, &writes, "PATCH", "/repos/o/opening").await;
+        let _put = record(&mut server, &writes, "PUT", "/repos/o/opening/actions/permissions/access").await;
+        let _closing = record(&mut server, &writes, "PATCH", "/repos/o/closing").await;
+        let opening = "- name: opening\n  visibility: private\n  settings: {visibility: private, access_level: organization}\n";
+
+        // A repo the config makes public can't keep an access level: refused before any repo is touched, dry run too.
+        let bad = write_file(&format!("org: o\nrepos:\n{opening}- name: closing\n  settings: {{visibility: public, access_level: organization}}\n"));
+        for dry_run in [true, false] {
+            let err = client(&server).sync(bad.path().to_str().expect("utf-8 path"), dry_run).await.expect_err("accepted");
+            assert!(err.to_string().contains("closing") && err.to_string().contains("public"), "{err}");
+        }
+        // `settings.visibility` and `visibility` must agree.
+        let split = write_file("org: o\nrepos:\n- name: opening\n  visibility: public\n  settings: {visibility: private}\n");
+        assert!(client(&server).sync(split.path().to_str().expect("utf-8 path"), true).await.is_err(), "disagreeing visibilities accepted");
+        assert!(writes.lock().expect("lock").is_empty(), "wrote before refusing the config");
+
+        // Going private, then the access level the private repo can now have; going public with `none` writes no access.
+        let good = write_file(&format!("org: o\nrepos:\n{opening}- name: closing\n  settings: {{visibility: public, access_level: none}}\n"));
+        client(&server).sync(good.path().to_str().expect("utf-8 path"), false).await.expect("sync");
+        assert_eq!(
+            *writes.lock().expect("lock"),
+            [
+                r#"PATCH /repos/o/opening {"visibility":"private"}"#,
+                r#"PUT /repos/o/opening/actions/permissions/access {"access_level":"organization"}"#,
+                r#"PATCH /repos/o/closing {"visibility":"public"}"#,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_merge_goes_on_only_after_its_ruleset_is_written() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_full(&mut server, &[("r", json!({}))], |_| json!([]), |_| Some(vec![])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _patch = record(&mut server, &writes, "PATCH", "/repos/o/r").await;
+        let refused = {
+            let writes = writes.clone();
+            server.mock("POST", "/repos/o/r/rulesets").with_status(422)
+                .with_body_from_request(move |_| { writes.lock().expect("lock").push("POST refused".into()); b"{}".to_vec() })
+                .expect(1).create_async().await
+        };
+        let config = write_file("org: o\nrepos:\n- name: r\n  settings: {allow_auto_merge: true, allow_merge_commit: true}\n  required_checks: [A]\n");
+        let path = config.path().to_str().expect("utf-8 path");
+        assert!(client(&server).sync(path, false).await.is_err(), "a refused ruleset write passed");
+        assert_eq!(*writes.lock().expect("lock"), [r#"PATCH /repos/o/r {"allow_merge_commit":true}"#, "POST refused"]);
+        refused.assert_async().await;
+
+        let _post = record(&mut server, &writes, "POST", "/repos/o/r/rulesets").await;
+        writes.lock().expect("lock").clear();
+        client(&server).sync(path, false).await.expect("sync");
+        let writes = writes.lock().expect("lock");
+        assert_eq!(writes.len(), 3, "{writes:?}");
+        assert!(writes[1].starts_with("POST /repos/o/r/rulesets ") && writes[2] == r#"PATCH /repos/o/r {"allow_auto_merge":true}"#, "{writes:?}");
+    }
+
+    #[tokio::test]
+    async fn rewriting_require_ci_keeps_the_app_each_kept_check_is_pinned_to() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_full(&mut server, &[("r", json!({}))], |_| json!([]), |_| None).await;
+        // As GitHub returns it, written out by hand.
+        let held = r#"{
+            "id": 42, "name": "Require CI", "target": "branch", "source_type": "Repository", "source": "o/r",
+            "enforcement": "active", "bypass_actors": [],
+            "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            "rules": [{"type": "required_status_checks", "parameters": {
+                "strict_required_status_checks_policy": false, "do_not_enforce_on_create": false,
+                "required_status_checks": [{"context": "Unit Tests", "integration_id": 15368}, {"context": "Old"}]}}],
+            "node_id": "RRS_x", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let _list = server.mock("GET", "/repos/o/r/rulesets?includes_parents=false&per_page=100")
+            .with_body(r#"[{"id": 42, "name": "Require CI"}]"#).create_async().await;
+        let _detail = server.mock("GET", "/repos/o/r/rulesets/42").with_body(held).create_async().await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _put = record(&mut server, &writes, "PUT", "/repos/o/r/rulesets/42").await;
+        let config = write_file("org: o\nrepos:\n- name: r\n  required_checks: [Unit Tests, Lint]\n");
+        client(&server).sync(config.path().to_str().expect("utf-8 path"), false).await.expect("sync");
+        let writes = writes.lock().expect("lock");
+        let [put] = writes.as_slice() else { panic!("{writes:?}") };
+        let sent: serde_json::Value = serde_json::from_str(put.trim_start_matches("PUT /repos/o/r/rulesets/42 ")).expect("json body");
+        let expected: serde_json::Value = serde_json::from_str(r#"{
+            "name": "Require CI", "target": "branch", "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [{"type": "required_status_checks", "parameters": {
+                "strict_required_status_checks_policy": false, "do_not_enforce_on_create": false,
+                "required_status_checks": [{"context": "Unit Tests", "integration_id": 15368}, {"context": "Lint"}]}}]
+        }"#).expect("expected json");
+        assert_eq!(sent, expected);
+    }
+
+    #[tokio::test]
+    async fn required_checks_that_cant_be_read_keep_the_files_and_are_never_a_clean_diff() {
+        let mut server = mockito::Server::new_async().await;
+        // `list` fails at the rulesets list; `detail` lists `Require CI` but its rules can't be read.
+        let _mocks = mock_org_full(&mut server, &[("list", json!({})), ("detail", json!({}))], |_| json!([]), |_| None).await;
+        let _detail = server.mock("GET", "/repos/o/detail/rulesets?includes_parents=false&per_page=100")
+            .with_body(r#"[{"id": 5, "name": "Require CI"}]"#).create_async().await;
+        let file = write_file("org: o\nrepos:\n- name: list\n  required_checks: [A]\n- name: detail\n  required_checks: [B]\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(repo_block(&yaml, "list").contains("  required_checks:\n  - A"), "{yaml}");
+        assert!(repo_block(&yaml, "detail").contains("  required_checks:\n  - B"), "{yaml}");
+        assert!(client(&server).diff(path).await.expect("diff"), "diff called checks it never read a match");
     }
 
     #[tokio::test]

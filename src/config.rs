@@ -184,6 +184,22 @@ impl Config {
         let allowed = crate::api_mapping::repo_settings();
         let all = crate::github_api_mapping_generated::get_github_api_mapping();
         for (i, repo) in config.repos.iter().enumerate() {
+            let checks = &repo.required_checks;
+            if let Some(dup) = checks.iter().enumerate().find_map(|(j, c)| checks.iter().take(j).any(|x| x == c).then_some(c)) {
+                return Err(crate::error::AppError::Config(format!(
+                    "{main_path}: repos[{i}].required_checks (repo {}): `{dup}` is listed twice.",
+                    repo.name
+                )));
+            }
+            let in_settings = repo.settings.get("visibility").map(|v| v.as_str());
+            if let (Some(set), Some(top)) = (in_settings, repo.visibility.as_deref()) {
+                if set != Some(top) {
+                    return Err(crate::error::AppError::Config(format!(
+                        "{main_path}: repos[{i}] (repo {}): `settings.visibility` and `visibility` disagree; give one.",
+                        repo.name
+                    )));
+                }
+            }
             if repo.use_default_webhook && (repo.webhook.is_some() || config.default_webhook.is_none()) {
                 return Err(crate::error::AppError::Config(format!(
                     "{main_path}: repos[{i}] (repo {}): `use_default_webhook` needs a top-level `default_webhook` and no `webhook` of its own.",
@@ -356,6 +372,14 @@ allow_force_pushes: false
         assert!(rule.enforce_admins);
         assert!(!rule.allow_deletions);
         assert!(!rule.allow_force_pushes);
+    }
+
+    #[test]
+    fn a_check_listed_twice_is_refused() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"org: o\nrepos:\n- name: r\n  required_checks: [A, B, A]\n").unwrap();
+        let err = Config::from_file_with_defaults(file.path().to_str().unwrap(), None).unwrap_err().to_string();
+        assert!(err.contains("required_checks") && err.contains("`A` is listed twice"), "{err}");
     }
 
     #[test]
