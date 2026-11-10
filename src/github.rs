@@ -27,7 +27,7 @@ const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const ARCHIVED: &str = "archived";
 /// The repo setting that lets PRs merge themselves once their requirements are met.
 const ALLOW_AUTO_MERGE: &str = "allow_auto_merge";
-/// Who outside a private repo may use its Actions workflows: `none`, `user`, `organization` or `enterprise`.
+/// Who outside a private repo may use its Actions workflows: `none`, `user` or `organization`.
 const ACCESS_LEVEL: &str = "access_level";
 /// The repo ruleset `required_checks` is kept in. gh-config owns every rule in it.
 const REQUIRE_CI: &str = "Require CI";
@@ -261,9 +261,8 @@ impl GitHubClient {
         Ok(items)
     }
 
-    /// Fetch all settings for a repo as a HashMap<String, serde_yaml::Value>.
-    /// With `with_access`, a private repo's settings also hold its Actions `access_level` (one more request).
-    async fn get_repo_settings(&self, repo_name: &str, with_access: bool) -> AppResult<RepoSettings> {
+    /// Fetch all settings for a repo as a HashMap<String, serde_yaml::Value>
+    async fn get_repo_settings(&self, repo_name: &str) -> AppResult<RepoSettings> {
         let full_url = format!("{}/repos/{}/{}", self.api_url, self.org, repo_name);
         let response = self.get(&full_url).await?;
         let text = response.text().await?;
@@ -286,17 +285,22 @@ impl GitHubClient {
                 }
             }
         }
-        // Public repos have no access level: their workflows are open to everyone.
-        if with_access && settings.get("visibility").and_then(|v| v.as_str()).is_some_and(|v| v != "public") {
-            let url = format!("{}/repos/{}/{}/actions/permissions/access", self.api_url, self.org, repo_name);
-            let access: serde_json::Value = serde_json::from_str(&self.get(&url).await?.text().await?)
-                .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", url, e)))?;
-            let level = access[ACCESS_LEVEL]
-                .as_str()
-                .ok_or_else(|| AppError::GitHubApi(format!("GET {url} returned no `{ACCESS_LEVEL}`: {access}")))?;
-            settings.insert(ACCESS_LEVEL.to_string(), serde_yaml::Value::String(level.to_string()));
-        }
         Ok(settings)
+    }
+
+    /// A private repo's Actions `access_level`. Every failure, a 404 included, is a `GitHubApi` error, so a
+    /// caller can't take it for the repo itself missing.
+    async fn get_access_level(&self, repo_name: &str) -> AppResult<String> {
+        let url = format!("{}/repos/{}/{}/actions/permissions/access", self.api_url, self.org, repo_name);
+        let read = async {
+            let text = self.get(&url).await?.text().await?;
+            let access: serde_json::Value = serde_json::from_str(&text)?;
+            access[ACCESS_LEVEL]
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| AppError::GitHubApi(format!("no `{ACCESS_LEVEL}` in {access}")))
+        };
+        read.await.map_err(|e| AppError::GitHubApi(format!("Reading the Actions access level of {}/{} from {url}: {e}", self.org, repo_name)))
     }
 
     /// Creates a repo the config lists and GitHub doesn't have. Its `visibility` must be given: a guess could
@@ -954,7 +958,7 @@ impl GitHubClient {
         for repo in repo_json {
             let name = repo["name"].as_str().ok_or_else(|| AppError::GitHubApi("Missing repo name".to_string()))?.to_string();
             // Fetch *limited* settings relevant for generating a *manageable* config
-            let settings = match self.get_repo_settings(&name, true).await {
+            let mut settings = match self.get_repo_settings(&name).await {
                 Ok(full_settings) => {
                     let mut manageable_settings = RepoSettings::new();
                     // Only include settings we typically manage
@@ -980,6 +984,22 @@ impl GitHubClient {
 
             let visibility = if repo["private"].as_bool().unwrap_or(false) { Some("private".to_string()) } else { Some("public".to_string()) };
             let in_file = file.and_then(|file| file.repos.iter().find(|r| r.name == name));
+            // Public repos have no access level: their workflows are open to everyone.
+            if repo["private"].as_bool() == Some(true) {
+                match self.get_access_level(&name).await {
+                    Ok(level) if level != "none" => {
+                        settings.insert(ACCESS_LEVEL.to_string(), serde_yaml::Value::String(level));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("{e}. Its access level stays as the file has it.");
+                        unread.push(format!("{name} (access level)"));
+                        if let Some(level) = in_file.and_then(|r| r.settings.get(ACCESS_LEVEL)) {
+                            settings.insert(ACCESS_LEVEL.to_string(), level.clone());
+                        }
+                    }
+                }
+            }
             // Like settings above: report the repo and carry on, so one unreadable repo doesn't hide the rest.
             let (use_default_webhook, webhook) = match self.get_webhooks(&name).await {
                 Ok(hooks) => {
@@ -1105,8 +1125,7 @@ impl GitHubClient {
             // You might add more validation for repo.name characters here if needed
             // --- End logging ---
 
-            let with_access = repo.settings.contains_key(ACCESS_LEVEL);
-            let current = match self.get_repo_settings(&repo.name, with_access).await {
+            let mut current = match self.get_repo_settings(&repo.name).await {
                 Ok(current) => current,
                 Err(AppError::GitHubResponse { status: reqwest::StatusCode::NOT_FOUND, .. }) => {
                     self.create_repo(repo, dry_run).await?;
@@ -1114,10 +1133,21 @@ impl GitHubClient {
                         // Nothing to read until it exists; the real run applies its settings right after creating it.
                         continue;
                     }
-                    self.get_repo_settings(&repo.name, with_access).await?
+                    self.get_repo_settings(&repo.name).await?
                 }
                 Err(e) => return Err(e),
             };
+            // Read only when the config names it, so it's written only when it differs. Public repos have none.
+            if repo.settings.contains_key(ACCESS_LEVEL) {
+                if current.get("visibility").and_then(|v| v.as_str()) == Some("public") {
+                    return Err(AppError::Config(format!(
+                        "Repo {}: `{ACCESS_LEVEL}` applies only to private repos, and {}/{} is public.",
+                        repo.name, self.org, repo.name
+                    )));
+                }
+                let level = self.get_access_level(&repo.name).await?;
+                current.insert(ACCESS_LEVEL.to_string(), serde_yaml::Value::String(level));
+            }
             match (archived(&current, &repo.name)? == Some(true), archived(&repo.settings, &repo.name)?) {
                 (true, Some(false)) => self.set_archived(&repo.name, false, dry_run).await?,
                 (true, desired) => {
@@ -1902,8 +1932,16 @@ assignments:
     async fn sync_reads_the_access_level_and_writes_it_only_when_it_differs() {
         let mut server = mockito::Server::new_async().await;
         let private = |level: &str| json!({"private": true, "visibility": "private", ACCESS_LEVEL: level});
-        let repos = [("closed", private("none")), ("open", private("organization")), ("unnamed", private("none"))];
+        let repos = [
+            ("closed", private("none")),
+            ("open", private("organization")),
+            ("unnamed", private("none")),
+            ("broken", json!({"private": true, "visibility": "private"})),
+            ("pub", json!({})),
+        ];
         let _mocks = mock_org_full(&mut server, &repos, |_| json!([]), |_| Some(vec![])).await;
+        // An existing repo whose access level can't be read, e.g. with Actions off.
+        let _broken = server.mock("GET", "/repos/o/broken/actions/permissions/access").with_status(404).with_body(r#"{"message":"Not Found"}"#).create_async().await;
         let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let mut puts = Vec::new();
         for repo in ["closed", "open"] {
@@ -1914,6 +1952,28 @@ assignments:
         );
         client(&server).sync(config.path().to_str().expect("utf-8 path"), false).await.expect("sync");
         assert_eq!(*writes.lock().expect("lock"), [r#"PUT /repos/o/closed/actions/permissions/access {"access_level":"organization"}"#]);
+
+        // Neither is taken for a missing repo (no create is mocked), and nothing is written.
+        for (repo, says) in [("broken", "access level"), ("pub", "public")] {
+            let config = write_file(&format!("org: o\nrepos:\n- name: {repo}\n  visibility: private\n  settings: {{access_level: organization}}\n"));
+            let err = client(&server).sync(config.path().to_str().expect("utf-8 path"), true).await.expect_err("accepted");
+            assert!(err.to_string().contains(repo) && err.to_string().contains(says), "{err}");
+        }
+        assert_eq!(writes.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_access_level_that_cant_be_read_keeps_the_files_and_the_other_settings() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_full(&mut server, &[("r", json!({"private": true, "visibility": "private"}))], |_| json!([]), |_| Some(vec![])).await;
+        let _denied = server.mock("GET", "/repos/o/r/actions/permissions/access").with_status(403).with_body(r#"{"message":"Forbidden"}"#).create_async().await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  settings: {access_level: organization}\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        let block = repo_block(&yaml, "r");
+        assert!(block.contains("    access_level: organization\n") && block.contains("    allow_squash_merge: true\n"), "{yaml}");
+        assert!(client(&server).diff(path).await.expect("diff"), "diff called an access level it never read a match");
     }
 
     #[tokio::test]

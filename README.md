@@ -236,7 +236,7 @@ repos:
 ```
 
 - Like `archived`, `sync-from-org` writes `allow_auto_merge: true` and an `access_level` other than `none` only when GitHub has them; `diff` treats `allow_auto_merge: false` and `access_level: none` in a config as GitHub's defaults, not differences.
-- `access_level` (GitHub's `/actions/permissions/access`) exists only for private repos. `sync` reads it only for repos whose config names it, and writes it only when it differs. `sync-from-org` and `diff` read it for every private repo: one extra request each.
+- `access_level` (GitHub's `/actions/permissions/access`: `none`, `user` or `organization`) exists only for private repos; `sync` refuses it on a public one. `sync` reads it only for repos whose config names it, and writes it only when it differs. `sync-from-org` and `diff` read it for every private repo: one extra request each. If that read fails, the repo keeps the file's value and `diff` names it and exits 1.
 
 ### Required checks
 
