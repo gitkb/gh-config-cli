@@ -91,7 +91,7 @@ fn bypass_actors(org: &str, repo: &Repo, teams: &TeamIds) -> AppResult<Vec<Bypas
         .map(|b| {
             let id = teams.iter().find(|(slug, _)| *slug == b.team).map(|(_, id)| *id).ok_or_else(|| {
                 AppError::Config(format!(
-                    "Repo {}: `required_checks_bypass` names team `{}`, which {org} doesn't have. A team the config adds is created after the repos: run sync again once it exists.",
+                    "Repo {}: `required_checks_bypass` names team `{}`, which neither {org} nor the config's `teams` has.",
                     repo.name, b.team
                 ))
             })?;
@@ -1138,6 +1138,10 @@ impl GitHubClient {
              yaml_content.push_str("\n");
          }
 
+         // Never replace a config with one that wouldn't load: every later command, this one included, would refuse it.
+         Config::from_yaml_str(&yaml_content, config_path).map_err(|e| {
+             AppError::Config(format!("The config generated from the org doesn't load, so {config_path} is left as it is: {e}"))
+         })?;
          if dry_run {
              println!("Dry run: Would write the following config to {}:\n{}", config_path, yaml_content);
          } else {
@@ -1258,6 +1262,9 @@ impl GitHubClient {
                             file_bypass
                         }
                     };
+                    // A config without checks leaves the ruleset alone, so a bypass list there would mean nothing:
+                    // the loader refuses one.
+                    let bypass = if checks.is_empty() { Vec::new() } else { bypass };
                     (checks, bypass)
                 }
                 Err(e) => {
@@ -1344,7 +1351,22 @@ impl GitHubClient {
         // An archived repo is read-only: unarchive before its other changes, archive after all of them,
         // and leave the settings and webhook of a repo that stays archived alone.
         let mut to_archive = Vec::new();
-        let teams = if config.repos.iter().any(|r| !r.required_checks.is_empty()) { self.team_ids().await? } else { Vec::new() };
+        // Teams come before repos, so a repo's bypass list may name a team this config adds. Every bypass list is
+        // checked before the first write; a team still to be created stands in with id 0 until it exists.
+        let gated = config.repos.iter().any(|r| !r.required_checks.is_empty());
+        let mut teams = if gated { self.team_ids().await? } else { Vec::new() };
+        let adds: Vec<(String, u64)> = config.teams.iter().filter(|t| !teams.iter().any(|(slug, _)| *slug == t.name)).map(|t| (t.name.clone(), 0)).collect();
+        teams.extend(adds.iter().cloned());
+        for repo in &config.repos {
+            bypass_actors(&self.org, repo, &teams)?;
+        }
+        for team in &config.teams {
+            info!("Processing team: {}", team.name);
+            self.create_team(team, dry_run).await?;
+        }
+        if gated && !adds.is_empty() && !dry_run {
+            teams = self.team_ids().await?;
+        }
         for repo in &config.repos {
             // --- Add logging just before the failing call ---
             info!("Processing repo: {}/{}", self.org, repo.name);
@@ -1400,12 +1422,6 @@ impl GitHubClient {
             }
             self.sync_required_checks(repo, &teams, dry_run).await?;
             self.update_repo_settings(repo, &current, |k| k == ALLOW_AUTO_MERGE, dry_run).await?;
-        }
-
-        // Teams
-        for team in &config.teams {
-            info!("Processing team: {}", team.name); // Add similar logging for other resources
-          self.create_team(team, dry_run).await?;
         }
 
         // Users
@@ -2539,6 +2555,81 @@ assignments:
         let err = client(&server).sync(file.path().to_str().expect("utf-8 path"), false).await.expect_err("accepted");
         assert!(err.to_string().contains("team `ghosts`"), "{err}");
         assert!(writes.lock().expect("lock").is_empty(), "wrote a ruleset for an unknown team");
+    }
+
+    /// Org `o` with repo `r` and no rulesets, where team `release` exists only once `POST /orgs/o/teams` was sent.
+    /// Records every write.
+    async fn mock_org_creating_release(server: &mut mockito::ServerGuard, writes: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Vec<mockito::Mock> {
+        let created = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_created = created.clone();
+        let repo = json!({"name": "r", "private": false, "visibility": "public", "archived": false,
+            "allow_merge_commit": false, "allow_squash_merge": true, "allow_rebase_merge": true});
+        let teams = server.mock("GET", "/orgs/o/teams?per_page=100").with_body_from_request(move |_| {
+            let list = if is_created.load(std::sync::atomic::Ordering::SeqCst) { r#"[{"slug": "release", "name": "release", "id": 31}]"# } else { "[]" };
+            list.as_bytes().to_vec()
+        });
+        let create = {
+            let writes = writes.clone();
+            server.mock("POST", "/orgs/o/teams").with_body_from_request(move |req| {
+                created.store(true, std::sync::atomic::Ordering::SeqCst);
+                writes.lock().expect("lock").push(format!("POST /orgs/o/teams {}", req.utf8_lossy_body().expect("body")));
+                b"{}".to_vec()
+            })
+        };
+        vec![
+            teams.create_async().await,
+            create.create_async().await,
+            server.mock("GET", "/orgs/o/teams/release").with_status(404).create_async().await,
+            server.mock("GET", "/repos/o/r").with_body(repo.to_string()).create_async().await,
+            server.mock("GET", "/repos/o/r/rulesets?includes_parents=false&per_page=100").with_body("[]").create_async().await,
+            record(server, writes, "POST", "/repos/o/r/rulesets").await,
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_bypass_team_the_same_config_adds_is_created_first_and_then_used() {
+        let mut server = mockito::Server::new_async().await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _mocks = mock_org_creating_release(&mut server, &writes).await;
+        let file = write_file("org: o\nteams:\n- name: release\n  members: []\nrepos:\n- name: r\n  required_checks: [A]\n  required_checks_bypass: [{team: release, mode: pull_request}]\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).sync(path, true).await.expect("dry run");
+        assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
+        client(&server).sync(path, false).await.expect("sync");
+        let writes = writes.lock().expect("lock");
+        let [team, ruleset] = writes.as_slice() else { panic!("{writes:?}") };
+        assert!(team.starts_with("POST /orgs/o/teams "), "{writes:?}");
+        let sent: serde_json::Value = serde_json::from_str(ruleset.trim_start_matches("POST /repos/o/r/rulesets ")).expect("json body");
+        assert_eq!(sent["bypass_actors"], json!([{"actor_id": 31, "actor_type": "Team", "bypass_mode": "pull_request"}]));
+    }
+
+    #[tokio::test]
+    async fn a_bypass_team_nobody_creates_is_refused_before_any_write() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_with_teams(&mut server, &[("core", 9)], &[("a", json!({})), ("r", json!({}))], |_| json!([]), |_| Some(vec![])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _patch = record(&mut server, &writes, "PATCH", "/repos/o/a").await;
+        let _post = record(&mut server, &writes, "POST", "/repos/o/a/rulesets").await;
+        // `a` comes first and is fine; `r` names a team neither the org nor the config has.
+        let file = write_file("org: o\nrepos:\n- name: a\n  settings: {allow_merge_commit: true}\n  required_checks: [A]\n- name: r\n  required_checks: [A]\n  required_checks_bypass: [{team: ghosts, mode: always}]\n");
+        let err = client(&server).sync(file.path().to_str().expect("utf-8 path"), false).await.expect_err("accepted");
+        assert!(err.to_string().contains("team `ghosts`") && err.to_string().contains("Repo r"), "{err}");
+        assert!(writes.lock().expect("lock").is_empty(), "wrote before refusing: {:?}", writes.lock().expect("lock"));
+    }
+
+    #[tokio::test]
+    async fn a_ruleset_requiring_no_checks_exports_a_config_that_loads() {
+        let mut server = mockito::Server::new_async().await;
+        // Someone removed the checks rule but the bypass list stayed: a config can't hold a bypass without checks.
+        let mut ruleset = require_a_with(5, Some(json!([{"actor_id": 9, "actor_type": "Team", "bypass_mode": "pull_request"}])));
+        ruleset["rules"] = json!([]);
+        let _mocks = mock_org_with_teams(&mut server, &[("core", 9)], &[("r", json!({}))], |_| json!([]), |_| Some(vec![ruleset.clone()])).await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_checks: [A]\n  required_checks_bypass: [{team: core, mode: pull_request}]\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        let config = Config::from_file_with_defaults(path, None).expect("the exported config doesn't load");
+        let repo = config.repos.iter().find(|r| r.name == "r").expect("repo r");
+        assert!(repo.required_checks.is_empty() && repo.required_checks_bypass.is_empty(), "{repo:?}");
     }
 
     #[tokio::test]

@@ -210,6 +210,15 @@ impl Config {
             }
         }
 
+        Self::from_value(main_config, main_path)
+    }
+
+    /// Reads a config from YAML text; `main_path` names it in errors. Checked like a config file.
+    pub fn from_yaml_str(text: &str, main_path: &str) -> crate::error::AppResult<Self> {
+        Self::from_value(serde_yaml::from_str(text).map_err(crate::error::AppError::Serialization)?, main_path)
+    }
+
+    fn from_value(main_config: Value, main_path: &str) -> crate::error::AppResult<Self> {
         // Unknown or misplaced keys are refused, naming the file, where the key is and the keys allowed there.
         let config: Config = serde_path_to_error::deserialize(main_config)
             .map_err(|e| crate::error::AppError::Config(format!("{main_path}: {}: {}", e.path(), e.inner())))?;
