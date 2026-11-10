@@ -9,7 +9,7 @@
     Public APIs are documented for maintainability. Internal response structs are used for deserialization.
 */
 
-use crate::config::{Assignment, Repo, RepoSettings, Team, User, WebhookConfig, Config};
+use crate::config::{Assignment, BypassMode, CheckBypass, Repo, RepoSettings, Team, User, WebhookConfig, Config};
 use crate::error::{AppError, AppResult};
 use colored::*;
 use log::{debug, info, error};
@@ -50,10 +50,79 @@ struct RequiredCheck {
     integration_id: Option<u64>,
 }
 
+/// One entry of a ruleset's bypass list, as GitHub holds it: a team, an app, a role, the org's admins...
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BypassActor {
+    actor_type: String,
+    actor_id: Option<u64>,
+    mode: String,
+}
+
+/// The org's teams, `(slug, id)`: a config names a team by slug, a ruleset by id.
+type TeamIds = [(String, u64)];
+
+impl BypassActor {
+    fn team(id: u64, mode: BypassMode) -> Self {
+        BypassActor { actor_type: "Team".into(), actor_id: Some(id), mode: mode.as_str().into() }
+    }
+
+    /// The config entry for this actor, if a config can name it: a team the org has, with a known mode.
+    fn as_config(&self, teams: &TeamIds) -> Option<CheckBypass> {
+        let team = teams.iter().find(|(_, id)| self.actor_type == "Team" && Some(*id) == self.actor_id)?.0.clone();
+        let mode = serde_yaml::from_value(serde_yaml::Value::String(self.mode.clone())).ok()?;
+        Some(CheckBypass { team, mode })
+    }
+
+    /// For people to read.
+    fn describe(&self, teams: &TeamIds) -> String {
+        match (self.as_config(teams), self.actor_id) {
+            (Some(b), _) => format!("{} ({})", b.team, self.mode),
+            (None, Some(id)) => format!("{} #{id} ({})", self.actor_type, self.mode),
+            (None, None) => format!("{} ({})", self.actor_type, self.mode),
+        }
+    }
+}
+
+/// The bypass list a config's entries stand for, sorted. A team the org doesn't have is refused.
+fn bypass_actors(org: &str, repo: &Repo, teams: &TeamIds) -> AppResult<Vec<BypassActor>> {
+    let mut actors = repo
+        .required_checks_bypass
+        .iter()
+        .map(|b| {
+            let id = teams.iter().find(|(slug, _)| *slug == b.team).map(|(_, id)| *id).ok_or_else(|| {
+                AppError::Config(format!(
+                    "Repo {}: `required_checks_bypass` names team `{}`, which {org} doesn't have. A team the config adds is created after the repos: run sync again once it exists.",
+                    repo.name, b.team
+                ))
+            })?;
+            Ok(BypassActor::team(id, b.mode))
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    actors.sort();
+    Ok(actors)
+}
+
+/// The bypass part of a dry run's line: who may bypass after the write, and who no longer may.
+fn bypass_change(bypass: &[BypassActor], held: Option<&[BypassActor]>, exists: bool, teams: &TeamIds) -> String {
+    let named = |actors: &[&BypassActor]| actors.iter().map(|a| a.describe(teams)).collect::<Vec<_>>().join(", ");
+    let allowed = if bypass.is_empty() { "nobody".to_string() } else { named(&bypass.iter().collect::<Vec<_>>()) };
+    let dropped = match held {
+        Some(held) => {
+            let gone: Vec<_> = held.iter().filter(|a| !bypass.contains(a)).collect();
+            if gone.is_empty() { String::new() } else { format!("; no longer bypassing: {}", named(&gone)) }
+        }
+        None if exists => "; its current bypass list can't be read with this token".to_string(),
+        None => String::new(),
+    };
+    format!("bypass: {allowed}{dropped}")
+}
+
 /// A repo's `Require CI` ruleset as GitHub holds it.
 struct RequireCi {
     id: u64,
     checks: Vec<RequiredCheck>,
+    /// Sorted. `None` when GitHub didn't say: it shows a ruleset's bypass list only to tokens that can administer the repo.
+    bypass: Option<Vec<BypassActor>>,
     /// Whether everything but the checks is what `sync` writes: active, on the default branch, not strict.
     standard: bool,
 }
@@ -64,8 +133,15 @@ impl RequireCi {
     }
 }
 
-/// The `Require CI` ruleset `sync` writes for `checks`.
-fn require_ci_body(checks: &[RequiredCheck]) -> serde_json::Value {
+/// The `Require CI` ruleset `sync` writes for `checks`, which only `bypass` may merge past.
+fn require_ci_body(checks: &[RequiredCheck], bypass: &[BypassActor]) -> serde_json::Value {
+    let bypass: Vec<_> = bypass
+        .iter()
+        .map(|a| match a.actor_id {
+            Some(id) => json!({ "actor_id": id, "actor_type": a.actor_type, "bypass_mode": a.mode }),
+            None => json!({ "actor_type": a.actor_type, "bypass_mode": a.mode }),
+        })
+        .collect();
     let checks: Vec<_> = checks
         .iter()
         .map(|c| match c.integration_id {
@@ -77,6 +153,7 @@ fn require_ci_body(checks: &[RequiredCheck]) -> serde_json::Value {
         "name": REQUIRE_CI,
         "target": "branch",
         "enforcement": "active",
+        "bypass_actors": bypass,
         "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
         "rules": [{
             "type": REQUIRED_STATUS_CHECKS,
@@ -124,7 +201,19 @@ fn parse_require_ci(repo: &str, ruleset: &serde_json::Value) -> AppResult<Requir
         && ref_name["include"] == json!(["~DEFAULT_BRANCH"])
         && ref_name["exclude"].as_array().is_some_and(Vec::is_empty)
         && params.is_some_and(|p| p["strict_required_status_checks_policy"] == false && p["do_not_enforce_on_create"] == false);
-    Ok(RequireCi { id, checks, standard })
+    let bypass = ruleset["bypass_actors"].as_array().map(|actors| {
+        let mut actors: Vec<_> = actors
+            .iter()
+            .map(|a| BypassActor {
+                actor_type: a["actor_type"].as_str().unwrap_or("?").to_string(),
+                actor_id: a["actor_id"].as_u64(),
+                mode: a["bypass_mode"].as_str().unwrap_or("?").to_string(),
+            })
+            .collect();
+        actors.sort();
+        actors
+    });
+    Ok(RequireCi { id, checks, bypass, standard })
 }
 
 /// Whether two check lists hold the same names, in any order.
@@ -420,12 +509,26 @@ impl GitHubClient {
         parse_require_ci(repo, &ruleset).map(Some)
     }
 
-    /// Makes the repo's `Require CI` ruleset require exactly `repo.required_checks`. A repo with none is left alone.
-    async fn sync_required_checks(&self, repo: &Repo, dry_run: bool) -> AppResult<()> {
+    /// The org's teams as `(slug, id)`.
+    async fn team_ids(&self) -> AppResult<Vec<(String, u64)>> {
+        let teams: Vec<serde_json::Value> = self.get_all(&format!("{}/orgs/{}/teams?per_page=100", self.api_url, self.org)).await?;
+        teams
+            .iter()
+            .map(|t| match (t["slug"].as_str(), t["id"].as_u64()) {
+                (Some(slug), Some(id)) => Ok((slug.to_string(), id)),
+                _ => Err(AppError::GitHubApi("Missing team slug or id".to_string())),
+            })
+            .collect()
+    }
+
+    /// Makes the repo's `Require CI` ruleset require exactly `repo.required_checks`, with exactly
+    /// `repo.required_checks_bypass` allowed past them. A repo with no checks is left alone.
+    async fn sync_required_checks(&self, repo: &Repo, teams: &TeamIds, dry_run: bool) -> AppResult<()> {
         let checks = &repo.required_checks;
         if checks.is_empty() {
             return Ok(());
         }
+        let bypass = bypass_actors(&self.org, repo, teams)?;
         let current = self.read_require_ci(&repo.name).await?;
         let held = current.as_ref().map(|c| c.checks.clone()).unwrap_or_default();
         // A check kept from the ruleset keeps the app it's pinned to; a new one has none.
@@ -433,8 +536,9 @@ impl GitHubClient {
             .iter()
             .map(|name| held.iter().find(|c| &c.context == name).cloned().unwrap_or(RequiredCheck { context: name.clone(), integration_id: None }))
             .collect();
+        let held_bypass = current.as_ref().and_then(|c| c.bypass.clone());
         let (method, url) = match current {
-            Some(current) if current.standard && same_checks(&current.contexts(), checks) => return Ok(()),
+            Some(current) if current.standard && same_checks(&current.contexts(), checks) && current.bypass.as_ref() == Some(&bypass) => return Ok(()),
             Some(current) => (Method::PUT, format!("{}/repos/{}/{}/rulesets/{}", self.api_url, self.org, repo.name, current.id)),
             None => (Method::POST, format!("{}/repos/{}/{}/rulesets", self.api_url, self.org, repo.name)),
         };
@@ -442,11 +546,12 @@ impl GitHubClient {
         if dry_run {
             let removed: Vec<_> = held.iter().map(|c| c.context.as_str()).filter(|c| !checks.iter().any(|n| n == c)).collect();
             let removed = if removed.is_empty() { String::new() } else { format!("; no longer requiring: {}", removed.join(", ")) };
-            println!("[Dry Run] Would {verb} ruleset `{REQUIRE_CI}` on {}/{} requiring: {}{removed}", self.org, repo.name, checks.join(", "));
+            let bypass = bypass_change(&bypass, held_bypass.as_deref(), method == Method::PUT, teams);
+            println!("[Dry Run] Would {verb} ruleset `{REQUIRE_CI}` on {}/{} requiring: {}{removed}; {bypass}", self.org, repo.name, checks.join(", "));
             return Ok(());
         }
-        self.client.request(method, &url, "application/vnd.github+json", Some(require_ci_body(&desired))).await?;
-        info!("Ruleset `{REQUIRE_CI}` on {}/{} now requires: {}", self.org, repo.name, checks.join(", "));
+        self.client.request(method, &url, "application/vnd.github+json", Some(require_ci_body(&desired, &bypass))).await?;
+        info!("Ruleset `{REQUIRE_CI}` on {}/{} now requires: {}; bypass: {}", self.org, repo.name, checks.join(", "), bypass.len());
         Ok(())
     }
 
@@ -990,6 +1095,13 @@ impl GitHubClient {
                         yaml_content.push_str(&format!("  - {}\n", serde_yaml::to_string(check)?.trim()));
                     }
                 }
+                if !repo.required_checks_bypass.is_empty() {
+                    yaml_content.push_str("  required_checks_bypass:\n");
+                    for bypass in &repo.required_checks_bypass {
+                        yaml_content.push_str(&format!("  - team: {}\n", serde_yaml::to_string(&bypass.team)?.trim()));
+                        yaml_content.push_str(&format!("    mode: {}\n", bypass.mode.as_str()));
+                    }
+                }
                 // Add branch protections if needed
                 if !repo.branch_protections.is_empty() {
                     // Serialize properly
@@ -1047,6 +1159,7 @@ impl GitHubClient {
         // This is essentially the original logic of generate_config_from_org
          let mut repos = Vec::new();
         let mut unread = Vec::new();
+        let team_ids = self.team_ids().await?;
         let repo_url = format!("{}/orgs/{}/repos?per_page=100", self.api_url, self.org);
         let repo_json: Vec<serde_json::Value> = self.get_all(&repo_url).await?;
 
@@ -1118,16 +1231,39 @@ impl GitHubClient {
                 }
             };
             let file_checks = in_file.map(|r| r.required_checks.clone()).unwrap_or_default();
-            let required_checks = match self.read_require_ci(&name).await {
-                // The file's order when it names the same checks, so regenerating doesn't reorder them.
-                Ok(found) => match found.map(|r| r.contexts()).unwrap_or_default() {
-                    checks if same_checks(&checks, &file_checks) => file_checks,
-                    checks => checks,
-                },
+            let file_bypass = in_file.map(|r| r.required_checks_bypass.clone()).unwrap_or_default();
+            let (required_checks, required_checks_bypass) = match self.read_require_ci(&name).await {
+                Ok(found) => {
+                    // The file's order when it names the same checks, so regenerating doesn't reorder them.
+                    let checks = match found.as_ref().map(RequireCi::contexts).unwrap_or_default() {
+                        checks if same_checks(&checks, &file_checks) => file_checks,
+                        checks => checks,
+                    };
+                    let bypass = match found.as_ref().map(|r| r.bypass.as_deref()) {
+                        None => Ok(Vec::new()),
+                        Some(None) => Err("GitHub didn't show its bypass list (it does only to tokens that can administer the repo)".to_string()),
+                        Some(Some(actors)) => actors
+                            .iter()
+                            .map(|a| a.as_config(&team_ids).ok_or_else(|| format!("its bypass list holds {}, which a config can't name", a.describe(&team_ids))))
+                            .collect::<Result<Vec<_>, _>>(),
+                    };
+                    let bypass = match bypass {
+                        Ok(mut bypass) => {
+                            bypass.sort();
+                            bypass
+                        }
+                        Err(why) => {
+                            error!("The `{REQUIRE_CI}` ruleset of repo {name}: {why}. Its bypass list stays as the file has it.");
+                            unread.push(format!("{name} (required-check bypass)"));
+                            file_bypass
+                        }
+                    };
+                    (checks, bypass)
+                }
                 Err(e) => {
                     error!("Failed to read the `{}` ruleset of repo {}: {}. Its required checks stay as the file has them.", REQUIRE_CI, name, e);
                     unread.push(format!("{name} (required checks)"));
-                    file_checks
+                    (file_checks, file_bypass)
                 }
             };
 
@@ -1139,17 +1275,14 @@ impl GitHubClient {
                 webhook,
                 branch_protections: vec![], // Add logic to fetch these if needed
                 required_checks,
+                required_checks_bypass,
             });
         }
 
         // Fetch teams, users, assignments as before (full state needed for generation)
         let mut teams = Vec::new();
-        let team_url = format!("{}/orgs/{}/teams?per_page=100", self.api_url, self.org);
-        let team_json: Vec<serde_json::Value> = self.get_all(&team_url).await?;
-
-        for team in team_json {
+        for (name, _) in team_ids {
             // Fetch full team data including members
-             let name = team["slug"].as_str().ok_or_else(|| AppError::GitHubApi("Missing team slug".to_string()))?.to_string();
             let mut members: Vec<String> = self.get_team_members(&name).await?.into_iter().collect();
             members.sort();
 
@@ -1211,6 +1344,7 @@ impl GitHubClient {
         // An archived repo is read-only: unarchive before its other changes, archive after all of them,
         // and leave the settings and webhook of a repo that stays archived alone.
         let mut to_archive = Vec::new();
+        let teams = if config.repos.iter().any(|r| !r.required_checks.is_empty()) { self.team_ids().await? } else { Vec::new() };
         for repo in &config.repos {
             // --- Add logging just before the failing call ---
             info!("Processing repo: {}/{}", self.org, repo.name);
@@ -1264,7 +1398,7 @@ impl GitHubClient {
             if let Some(webhook) = repo.webhook.as_ref() {
                 self.manage_webhooks(&repo.name, webhook, dry_run).await?;
             }
-            self.sync_required_checks(repo, dry_run).await?;
+            self.sync_required_checks(repo, &teams, dry_run).await?;
             self.update_repo_settings(repo, &current, |k| k == ALLOW_AUTO_MERGE, dry_run).await?;
         }
 
@@ -1324,9 +1458,10 @@ impl GitHubClient {
                 }
             }
         }
-        // Required checks are a set: their order means nothing.
+        // Required checks and their bypass list are sets: their order means nothing.
         for repo in diff_local_config.repos.iter_mut().chain(diff_github_config.repos.iter_mut()) {
             repo.required_checks.sort();
+            repo.required_checks_bypass.sort();
         }
 
         // --- Step 4: Compare the webhook each repo ends up with ---
@@ -1514,10 +1649,30 @@ mod tests {
         hooks: impl Fn(&str) -> serde_json::Value,
         rulesets: impl Fn(&str) -> Option<Vec<serde_json::Value>>,
     ) -> Vec<mockito::Mock> {
+        mock_org_with_teams(server, &[], repos, hooks, rulesets).await
+    }
+
+    /// `mock_org_full` with teams `(slug, id)`, each with no members and no repos.
+    async fn mock_org_with_teams(
+        server: &mut mockito::ServerGuard,
+        teams: &[(&str, u64)],
+        repos: &[(&str, serde_json::Value)],
+        hooks: impl Fn(&str) -> serde_json::Value,
+        rulesets: impl Fn(&str) -> Option<Vec<serde_json::Value>>,
+    ) -> Vec<mockito::Mock> {
+        let team_list: Vec<_> = teams.iter().map(|(slug, id)| json!({"slug": slug, "name": slug, "id": id})).collect();
         let mut mocks = vec![
-            server.mock("GET", "/orgs/o/teams?per_page=100").with_body("[]").create_async().await,
+            server.mock("GET", "/orgs/o/teams?per_page=100").with_body(json!(team_list).to_string()).create_async().await,
             server.mock("GET", "/orgs/o/members?per_page=100").with_body("[]").create_async().await,
         ];
+        for (slug, _) in teams {
+            let url = format!("/orgs/o/teams/{slug}");
+            mocks.push(server.mock("GET", url.as_str()).with_body(json!({"name": slug}).to_string()).create_async().await);
+            for what in ["members", "repos"] {
+                let url = format!("/orgs/o/teams/{slug}/{what}?per_page=100");
+                mocks.push(server.mock("GET", url.as_str()).with_body("[]").create_async().await);
+            }
+        }
         let page = |n: usize| if n == 1 { "/orgs/o/repos?per_page=100".to_string() } else { format!("/orgs/o/repos?per_page=100&page={n}") };
         for (i, (name, fields)) in repos.iter().enumerate() {
             let mut repo = json!({"name": name, "private": false, "visibility": "public", "archived": false,
@@ -1562,7 +1717,7 @@ mod tests {
 
     /// A `Require CI` ruleset with id `id` requiring `checks`, as `sync` writes it.
     fn require_ci(id: u64, checks: &[&str]) -> serde_json::Value {
-        let mut ruleset = require_ci_body(&unpinned(checks));
+        let mut ruleset = require_ci_body(&unpinned(checks), &[]);
         ruleset["id"] = json!(id);
         ruleset
     }
@@ -2115,7 +2270,7 @@ assignments:
         client(&server).sync(path, true).await.expect("dry run");
         assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
         client(&server).sync(path, false).await.expect("sync");
-        let body = |checks: &[&str]| require_ci_body(&unpinned(checks)).to_string();
+        let body = |checks: &[&str]| require_ci_body(&unpinned(checks), &[]).to_string();
         assert_eq!(
             *writes.lock().expect("lock"),
             [format!("POST /repos/o/fresh/rulesets {}", body(&["A", "Clippy & Docs"])), format!("PUT /repos/o/adopt/rulesets/7 {}", body(&["A", "B"]))]
@@ -2271,13 +2426,119 @@ assignments:
         let [put] = writes.as_slice() else { panic!("{writes:?}") };
         let sent: serde_json::Value = serde_json::from_str(put.trim_start_matches("PUT /repos/o/r/rulesets/42 ")).expect("json body");
         let expected: serde_json::Value = serde_json::from_str(r#"{
-            "name": "Require CI", "target": "branch", "enforcement": "active",
+            "name": "Require CI", "target": "branch", "enforcement": "active", "bypass_actors": [],
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [{"type": "required_status_checks", "parameters": {
                 "strict_required_status_checks_policy": false, "do_not_enforce_on_create": false,
                 "required_status_checks": [{"context": "Unit Tests", "integration_id": 15368}, {"context": "Lint"}]}}]
         }"#).expect("expected json");
         assert_eq!(sent, expected);
+    }
+
+    /// A `Require CI` ruleset requiring `A`, with `bypass_actors` as given (`None`: GitHub didn't show it).
+    fn require_a_with(id: u64, bypass: Option<serde_json::Value>) -> serde_json::Value {
+        let mut ruleset = require_ci(id, &["A"]);
+        match bypass {
+            Some(bypass) => ruleset["bypass_actors"] = bypass,
+            None => drop(ruleset.as_object_mut().expect("object").remove("bypass_actors")),
+        }
+        ruleset
+    }
+
+    #[tokio::test]
+    async fn an_adopted_ruleset_bypass_list_becomes_exactly_the_configs() {
+        let mut server = mockito::Server::new_async().await;
+        // Held: the core team always, the org's admins, an app. Wanted: the core team by PR only, nobody else.
+        let held = json!([
+            {"actor_id": 9, "actor_type": "Team", "bypass_mode": "always"},
+            {"actor_id": 1, "actor_type": "OrganizationAdmin", "bypass_mode": "always"},
+            {"actor_id": 77, "actor_type": "Integration", "bypass_mode": "pull_request"},
+        ]);
+        let ruleset = require_a_with(42, Some(held.clone()));
+        let _mocks = mock_org_with_teams(&mut server, &[("core", 9), ("other", 10)], &[("r", json!({}))], |_| json!([]), |_| Some(vec![ruleset.clone()])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _put = record(&mut server, &writes, "PUT", "/repos/o/r/rulesets/42").await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_checks: [A]\n  required_checks_bypass:\n  - team: core\n    mode: pull_request\n");
+        let path = file.path().to_str().expect("utf-8 path");
+
+        // What GitHub holds can't all be written in a config: diff says so instead of calling it a match.
+        assert!(client(&server).diff(path).await.expect("diff"), "a bypass list a config can't name was called a match");
+        client(&server).sync(path, true).await.expect("dry run");
+        assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
+        client(&server).sync(path, false).await.expect("sync");
+        let writes = writes.lock().expect("lock");
+        let [put] = writes.as_slice() else { panic!("{writes:?}") };
+        let sent: serde_json::Value = serde_json::from_str(put.trim_start_matches("PUT /repos/o/r/rulesets/42 ")).expect("json body");
+        assert_eq!(sent["bypass_actors"], json!([{"actor_id": 9, "actor_type": "Team", "bypass_mode": "pull_request"}]));
+        assert_eq!(sent["rules"], ruleset["rules"], "the checks changed");
+    }
+
+    #[test]
+    fn a_dry_run_names_who_may_bypass_and_who_no_longer_may() {
+        let teams = [("core".to_string(), 9)];
+        let core_pr = [BypassActor::team(9, BypassMode::PullRequest)];
+        let held = [
+            BypassActor::team(9, BypassMode::Always),
+            BypassActor { actor_type: "OrganizationAdmin".into(), actor_id: Some(1), mode: "always".into() },
+        ];
+        assert_eq!(
+            bypass_change(&core_pr, Some(&held), true, &teams),
+            "bypass: core (pull_request); no longer bypassing: core (always), OrganizationAdmin #1 (always)"
+        );
+        assert_eq!(bypass_change(&[], None, false, &teams), "bypass: nobody");
+        assert_eq!(bypass_change(&core_pr, None, true, &teams), "bypass: core (pull_request); its current bypass list can't be read with this token");
+    }
+
+    #[tokio::test]
+    async fn a_teams_bypass_round_trips_and_a_matching_ruleset_is_not_rewritten() {
+        let mut server = mockito::Server::new_async().await;
+        let ruleset = require_a_with(5, Some(json!([
+            {"actor_id": 10, "actor_type": "Team", "bypass_mode": "always"},
+            {"actor_id": 9, "actor_type": "Team", "bypass_mode": "pull_request"},
+        ])));
+        let _mocks = mock_org_with_teams(&mut server, &[("core", 9), ("other", 10)], &[("r", json!({}))], |_| json!([]), |_| Some(vec![ruleset.clone()])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _put = record(&mut server, &writes, "PUT", "/repos/o/r/rulesets/5").await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_checks: [A]\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(
+            repo_block(&yaml, "r").contains("  required_checks_bypass:\n  - team: core\n    mode: pull_request\n  - team: other\n    mode: always\n"),
+            "{yaml}"
+        );
+        assert!(!client(&server).diff(path).await.expect("diff"), "the exported config doesn't match what it was read from");
+        client(&server).sync(path, false).await.expect("sync");
+        assert!(writes.lock().expect("lock").is_empty(), "a matching ruleset was rewritten");
+    }
+
+    #[tokio::test]
+    async fn a_bypass_list_the_token_cant_see_is_kept_from_the_file_rewritten_by_sync_and_never_a_clean_diff() {
+        let mut server = mockito::Server::new_async().await;
+        let ruleset = require_a_with(5, None);
+        let _mocks = mock_org_with_teams(&mut server, &[("core", 9)], &[("r", json!({}))], |_| json!([]), |_| Some(vec![ruleset.clone()])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _put = record(&mut server, &writes, "PUT", "/repos/o/r/rulesets/5").await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_checks: [A]\n  required_checks_bypass: [{team: core, mode: pull_request}]\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        assert!(client(&server).diff(path).await.expect("diff"), "diff called a bypass list it never read a match");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(repo_block(&yaml, "r").contains("  required_checks_bypass:\n  - team: core\n    mode: pull_request\n"), "{yaml}");
+        client(&server).sync(path, false).await.expect("sync");
+        assert_eq!(writes.lock().expect("lock").len(), 1, "an unseen bypass list was assumed to match");
+    }
+
+    #[tokio::test]
+    async fn a_bypass_team_the_org_doesnt_have_is_refused_before_any_ruleset_write() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_with_teams(&mut server, &[("core", 9)], &[("r", json!({}))], |_| json!([]), |_| Some(vec![])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _post = record(&mut server, &writes, "POST", "/repos/o/r/rulesets").await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_checks: [A]\n  required_checks_bypass: [{team: ghosts, mode: always}]\n");
+        let err = client(&server).sync(file.path().to_str().expect("utf-8 path"), false).await.expect_err("accepted");
+        assert!(err.to_string().contains("team `ghosts`"), "{err}");
+        assert!(writes.lock().expect("lock").is_empty(), "wrote a ruleset for an unknown team");
     }
 
     #[tokio::test]
