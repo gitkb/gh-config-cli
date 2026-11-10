@@ -48,7 +48,11 @@ repos:                            # (list) Repository configurations
       allow_squash_merge: true
       allow_rebase_merge: true
       # ...any supported GitHub repo setting
-    visibility: public            # (string, optional) "public" or "private"
+      allow_auto_merge: true      # (bool) Let PRs merge themselves once required checks pass
+      access_level: organization  # (string, private repos only) Who may call this repo's workflows: none, user, organization
+    visibility: private           # (string, optional) "public" or "private"; required for sync to create a missing repo
+    required_checks:              # (list, optional) Checks a PR to the default branch must pass (ruleset `Require CI`)
+      - Unit Tests
     webhook:                      # (object, optional) This repo's own webhook
       url: "http://example.com"   # (string) Webhook endpoint URL
       content_type: "json"        # (string) Payload content type
