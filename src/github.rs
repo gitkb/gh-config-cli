@@ -111,6 +111,12 @@ fn parse_require_ci(repo: &str, ruleset: &serde_json::Value) -> AppResult<Requir
                 .collect()
         })
         .unwrap_or_default();
+    let checks: Vec<RequiredCheck> = checks;
+    if let Some(dup) = checks.iter().enumerate().find_map(|(j, c)| checks.iter().take(j).any(|x| x.context == c.context).then_some(&c.context)) {
+        return Err(AppError::GitHubApi(format!(
+            "Repo {repo}: its `{REQUIRE_CI}` ruleset requires `{dup}` twice (from different apps). A config names a check once, so gh-config would drop one: change the ruleset first."
+        )));
+    }
     let ref_name = &ruleset["conditions"]["ref_name"];
     let standard = rules.len() == 1
         && ruleset["target"] == "branch"
@@ -136,10 +142,34 @@ struct RulesetSummary {
     name: String,
 }
 
-/// The visibility the config gives a repo: `settings.visibility`, which `sync` writes, else `visibility`.
-/// Config loading has refused the two disagreeing.
-fn config_visibility(repo: &Repo) -> Option<&str> {
-    repo.settings.get("visibility").and_then(|v| v.as_str()).or(repo.visibility.as_deref())
+/// Whether `sync` makes a repo public (`Some(true)`) or private, from the only fields it writes for that: the
+/// settings' `visibility` and `private`, PATCHed onto the repo. `None` when neither is given. Settings that
+/// contradict each other, or aren't the type GitHub takes, are refused.
+fn written_public(repo: &Repo) -> AppResult<Option<bool>> {
+    let refuse = |problem: String| AppError::Config(format!("Repo {}: {problem}", repo.name));
+    let by_visibility = match repo.settings.get("visibility") {
+        None => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| refuse(format!("`settings.visibility` must be a string, got {v:?}")))? == "public"),
+    };
+    let by_private = match repo.settings.get("private") {
+        None => None,
+        Some(v) => Some(!v.as_bool().ok_or_else(|| refuse(format!("`settings.private` must be true or false, got {v:?}")))?),
+    };
+    match (by_visibility, by_private) {
+        (Some(a), Some(b)) if a != b => Err(refuse("`settings.visibility` and `settings.private` contradict each other.".into())),
+        (a, b) => Ok(a.or(b)),
+    }
+}
+
+/// Whether a repo is public once `sync` is done with it: what its settings write, else what it is now. That is
+/// GitHub's visibility (`current`) for a repo that exists, and the top-level `visibility` it is created with for
+/// one that doesn't (top-level `visibility` is used only to create). `None` only for a missing repo with no
+/// visibility, which `sync` refuses to create.
+fn ends_public(repo: &Repo, current: Option<&RepoSettings>) -> AppResult<Option<bool>> {
+    Ok(written_public(repo)?.or_else(|| match current {
+        Some(current) => Some(current.get("visibility").and_then(|v| v.as_str()) == Some("public")),
+        None => repo.visibility.as_deref().map(|v| v == "public"),
+    }))
 }
 
 /// Whether an `access_level` asks for more than `none`, the only level a public repo can have.
@@ -147,16 +177,26 @@ fn grants_access(repo: &Repo) -> bool {
     repo.settings.get(ACCESS_LEVEL).is_some_and(|v| v.as_str() != Some("none"))
 }
 
-/// Rejects, before anything reads or writes GitHub (dry runs included), an `access_level` other than `none` on a
-/// repo the config makes public: GitHub has no access level for public repos.
-fn check_access_levels(config: &Config) -> AppResult<()> {
-    match config.repos.iter().find(|r| config_visibility(r) == Some("public") && grants_access(r)) {
-        Some(repo) => Err(AppError::Config(format!(
-            "Repo {}: `{ACCESS_LEVEL}` other than `none` applies only to private repos, and the config makes it public.",
+/// Refuses an `access_level` other than `none` on a repo that ends up public (`ends_public`): GitHub has no access
+/// level for public repos.
+fn check_access_level(repo: &Repo, current: Option<&RepoSettings>) -> AppResult<()> {
+    if grants_access(repo) && ends_public(repo, current)? == Some(true) {
+        return Err(AppError::Config(format!(
+            "Repo {}: `{ACCESS_LEVEL}` other than `none` applies only to private repos, and it ends up public.",
             repo.name
-        ))),
-        None => Ok(()),
+        )));
     }
+    Ok(())
+}
+
+/// What the config alone decides, for every repo before anything reads or writes GitHub (dry runs included):
+/// visibility settings that contradict each other, and an access level on a repo its settings make public.
+/// Cases that turn on GitHub's current visibility are refused when `sync` reaches the repo, before its first write.
+fn check_access_levels(config: &Config) -> AppResult<()> {
+    config.repos.iter().try_for_each(|repo| match written_public(repo)? {
+        Some(true) if grants_access(repo) => check_access_level(repo, None),
+        _ => Ok(()),
+    })
 }
 
 /// Rejects a config whose `archived` values aren't booleans, before anything reads or writes GitHub.
@@ -1181,9 +1221,16 @@ impl GitHubClient {
             // You might add more validation for repo.name characters here if needed
             // --- End logging ---
 
-            let mut current = match self.get_repo_settings(&repo.name).await {
-                Ok(current) => current,
-                Err(AppError::GitHubResponse { status: reqwest::StatusCode::NOT_FOUND, .. }) => {
+            let found = match self.get_repo_settings(&repo.name).await {
+                Ok(current) => Some(current),
+                Err(AppError::GitHubResponse { status: reqwest::StatusCode::NOT_FOUND, .. }) => None,
+                Err(e) => return Err(e),
+            };
+            // Before this repo's first write, created or not.
+            check_access_level(repo, found.as_ref())?;
+            let mut current = match found {
+                Some(current) => current,
+                None => {
                     self.create_repo(repo, dry_run).await?;
                     if dry_run {
                         // Nothing to read until it exists; the real run applies its settings right after creating it.
@@ -1191,20 +1238,12 @@ impl GitHubClient {
                     }
                     self.get_repo_settings(&repo.name).await?
                 }
-                Err(e) => return Err(e),
             };
             // The access level exists only on private repos. Read it only when the config names it, so it's written
-            // only when it differs. A repo the config makes private now has none to read: it's written after the
+            // only when it differs. A repo the settings make private now has none to read: it's written after the
             // visibility PATCH (URL order, see `update_repo_settings`).
             let now_public = current.get("visibility").and_then(|v| v.as_str()) == Some("public");
-            let ends_public = config_visibility(repo).map_or(now_public, |v| v == "public");
-            if ends_public && grants_access(repo) {
-                // Only reachable when the config leaves visibility to GitHub: the rest was refused up front.
-                return Err(AppError::Config(format!(
-                    "Repo {}: `{ACCESS_LEVEL}` other than `none` applies only to private repos, and {}/{} is public.",
-                    repo.name, self.org, repo.name
-                )));
-            }
+            let skip_access = ends_public(repo, Some(&current))? == Some(true);
             if repo.settings.contains_key(ACCESS_LEVEL) && !now_public {
                 let level = self.get_access_level(&repo.name).await?;
                 current.insert(ACCESS_LEVEL.to_string(), serde_yaml::Value::String(level));
@@ -1221,7 +1260,6 @@ impl GitHubClient {
             }
             // Auto-merge goes on only after the ruleset that gates it, so a failed ruleset write never leaves PRs
             // merging with no checks. A public repo's `access_level: none` has nothing to write.
-            let skip_access = ends_public;
             self.update_repo_settings(repo, &current, |k| k != ALLOW_AUTO_MERGE && !(skip_access && k == ACCESS_LEVEL), dry_run).await?;
             if let Some(webhook) = repo.webhook.as_ref() {
                 self.manage_webhooks(&repo.name, webhook, dry_run).await?;
@@ -2025,11 +2063,13 @@ assignments:
         client(&server).sync(config.path().to_str().expect("utf-8 path"), false).await.expect("sync");
         assert_eq!(*writes.lock().expect("lock"), [r#"PUT /repos/o/closed/actions/permissions/access {"access_level":"organization"}"#]);
 
-        // Neither is taken for a missing repo (no create is mocked), and nothing is written. `pub` stays public:
-        // its config leaves visibility to GitHub.
-        for (repo, visibility, says) in [("broken", "\n  visibility: private", "access level"), ("pub", "", "public")] {
+        // Neither is taken for a missing repo (no create is mocked), and nothing is written, dry run or not. `pub`
+        // stays public: top-level `visibility` is used only to create a repo, so with or without it nothing makes
+        // `pub` private.
+        let cases = [("broken", "\n  visibility: private", "access level"), ("pub", "\n  visibility: private", "public"), ("pub", "", "public")];
+        for ((repo, visibility, says), dry_run) in cases.into_iter().flat_map(|case| [(case, true), (case, false)]) {
             let config = write_file(&format!("org: o\nrepos:\n- name: {repo}{visibility}\n  settings: {{access_level: organization}}\n"));
-            let err = client(&server).sync(config.path().to_str().expect("utf-8 path"), true).await.expect_err("accepted");
+            let err = client(&server).sync(config.path().to_str().expect("utf-8 path"), dry_run).await.expect_err("accepted");
             assert!(err.to_string().contains(repo) && err.to_string().contains(says), "{err}");
         }
         assert_eq!(writes.lock().expect("lock").len(), 1);
@@ -2110,37 +2150,74 @@ assignments:
     #[tokio::test]
     async fn visibility_changes_are_checked_up_front_and_ordered_before_the_access_level() {
         let mut server = mockito::Server::new_async().await;
-        let private = json!({"private": true, "visibility": "private", ACCESS_LEVEL: "organization"});
-        // `opening` is public, so it has no access level to read: none is mocked.
-        let _mocks = mock_org_full(&mut server, &[("opening", json!({})), ("closing", private)], |_| json!([]), |_| Some(vec![])).await;
+        let private = |level: &str| json!({"private": true, "visibility": "private", ACCESS_LEVEL: level});
+        // `by_private` and `by_visibility` are public, so they have no access level to read: none is mocked.
+        let repos = [("by_private", json!({})), ("by_visibility", json!({})), ("closing", private("organization")), ("quiet", private("none"))];
+        let _mocks = mock_org_full(&mut server, &repos, |_| json!([]), |_| Some(vec![])).await;
         let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let _patch = record(&mut server, &writes, "PATCH", "/repos/o/opening").await;
-        let _put = record(&mut server, &writes, "PUT", "/repos/o/opening/actions/permissions/access").await;
-        let _closing = record(&mut server, &writes, "PATCH", "/repos/o/closing").await;
-        let opening = "- name: opening\n  visibility: private\n  settings: {visibility: private, access_level: organization}\n";
-
-        // A repo the config makes public can't keep an access level: refused before any repo is touched, dry run too.
-        let bad = write_file(&format!("org: o\nrepos:\n{opening}- name: closing\n  settings: {{visibility: public, access_level: organization}}\n"));
-        for dry_run in [true, false] {
-            let err = client(&server).sync(bad.path().to_str().expect("utf-8 path"), dry_run).await.expect_err("accepted");
-            assert!(err.to_string().contains("closing") && err.to_string().contains("public"), "{err}");
+        let mut write_mocks = Vec::new();
+        for (method, path) in [
+            ("PATCH", "/repos/o/by_private"),
+            ("PUT", "/repos/o/by_private/actions/permissions/access"),
+            ("PATCH", "/repos/o/by_visibility"),
+            ("PUT", "/repos/o/by_visibility/actions/permissions/access"),
+            ("PATCH", "/repos/o/closing"),
+            ("PATCH", "/repos/o/quiet"),
+        ] {
+            write_mocks.push(record(&mut server, &writes, method, path).await);
         }
-        // `settings.visibility` and `visibility` must agree.
-        let split = write_file("org: o\nrepos:\n- name: opening\n  visibility: public\n  settings: {visibility: private}\n");
-        assert!(client(&server).sync(split.path().to_str().expect("utf-8 path"), true).await.is_err(), "disagreeing visibilities accepted");
+        let opening = "- name: by_private\n  settings: {private: true, access_level: organization}\n";
+
+        // `closing` is private with an access level. Settings that make it public while granting access, or that
+        // contradict each other, are refused before any repo is touched, the one listed before it included.
+        for bad in ["{private: false, access_level: organization}", "{visibility: public, access_level: organization}", "{visibility: public, private: true}"] {
+            let config = write_file(&format!("org: o\nrepos:\n{opening}- name: closing\n  settings: {bad}\n"));
+            for dry_run in [true, false] {
+                let err = client(&server).sync(config.path().to_str().expect("utf-8 path"), dry_run).await.expect_err(bad);
+                assert!(err.to_string().contains("closing"), "{err}");
+            }
+        }
         assert!(writes.lock().expect("lock").is_empty(), "wrote before refusing the config");
 
-        // Going private, then the access level the private repo can now have; going public with `none` writes no access.
-        let good = write_file(&format!("org: o\nrepos:\n{opening}- name: closing\n  settings: {{visibility: public, access_level: none}}\n"));
+        // Going private by either setting: the visibility PATCH, then the access level the private repo can now have.
+        // Going public with access `none` writes nothing for the access level.
+        let good = write_file(&format!(
+            "org: o\nrepos:\n{opening}- name: by_visibility\n  settings: {{visibility: private, access_level: user}}\n- name: quiet\n  settings: {{private: false, access_level: none}}\n"
+        ));
         client(&server).sync(good.path().to_str().expect("utf-8 path"), false).await.expect("sync");
         assert_eq!(
             *writes.lock().expect("lock"),
             [
-                r#"PATCH /repos/o/opening {"visibility":"private"}"#,
-                r#"PUT /repos/o/opening/actions/permissions/access {"access_level":"organization"}"#,
-                r#"PATCH /repos/o/closing {"visibility":"public"}"#,
+                r#"PATCH /repos/o/by_private {"private":true}"#,
+                r#"PUT /repos/o/by_private/actions/permissions/access {"access_level":"organization"}"#,
+                r#"PATCH /repos/o/by_visibility {"visibility":"private"}"#,
+                r#"PUT /repos/o/by_visibility/actions/permissions/access {"access_level":"user"}"#,
+                r#"PATCH /repos/o/quiet {"private":false}"#,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_ruleset_requiring_one_check_from_two_apps_is_refused_and_never_exported() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_full(&mut server, &[("r", json!({}))], |_| json!([]), |_| None).await;
+        let _list = server.mock("GET", "/repos/o/r/rulesets?includes_parents=false&per_page=100")
+            .with_body(r#"[{"id": 6, "name": "Require CI"}]"#).create_async().await;
+        let _detail = server.mock("GET", "/repos/o/r/rulesets/6").with_body(r#"{
+            "id": 6, "name": "Require CI", "target": "branch", "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [{"type": "required_status_checks", "parameters": {
+                "strict_required_status_checks_policy": false, "do_not_enforce_on_create": false,
+                "required_status_checks": [{"context": "Unit Tests", "integration_id": 1}, {"context": "Unit Tests", "integration_id": 2}]}}]
+        }"#).create_async().await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_checks: [Unit Tests]\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        let err = client(&server).sync(path, true).await.expect_err("accepted");
+        assert!(err.to_string().contains("`Unit Tests` twice"), "{err}");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(repo_block(&yaml, "r").contains("  required_checks:\n  - Unit Tests") && !yaml.contains("Unit Tests\n  - Unit Tests"), "{yaml}");
+        assert!(client(&server).diff(path).await.expect("diff"), "a ruleset that can't be represented was called a match");
     }
 
     #[tokio::test]

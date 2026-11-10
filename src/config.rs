@@ -191,15 +191,6 @@ impl Config {
                     repo.name
                 )));
             }
-            let in_settings = repo.settings.get("visibility").map(|v| v.as_str());
-            if let (Some(set), Some(top)) = (in_settings, repo.visibility.as_deref()) {
-                if set != Some(top) {
-                    return Err(crate::error::AppError::Config(format!(
-                        "{main_path}: repos[{i}] (repo {}): `settings.visibility` and `visibility` disagree; give one.",
-                        repo.name
-                    )));
-                }
-            }
             if repo.use_default_webhook && (repo.webhook.is_some() || config.default_webhook.is_none()) {
                 return Err(crate::error::AppError::Config(format!(
                     "{main_path}: repos[{i}] (repo {}): `use_default_webhook` needs a top-level `default_webhook` and no `webhook` of its own.",
