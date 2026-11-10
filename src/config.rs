@@ -88,6 +88,38 @@ pub struct Repo {
     /// `Require CI` ruleset. Empty: `sync` leaves the repo's rulesets alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_checks: Vec<String>,
+    /// The teams that may merge past `required_checks`, and how. Nobody else can: `sync` makes the ruleset's
+    /// bypass list exactly this, so leaving it out removes every bypass. Needs `required_checks`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_checks_bypass: Vec<CheckBypass>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+/// A team that may bypass a repo's `required_checks`.
+pub struct CheckBypass {
+    /// The team's slug, as in `teams`.
+    pub team: String,
+    pub mode: BypassMode,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+/// GitHub's ruleset `bypass_mode`.
+pub enum BypassMode {
+    /// Only by merging a PR; a direct push still has to pass the checks.
+    PullRequest,
+    /// By merging a PR or by pushing directly.
+    Always,
+}
+
+impl BypassMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BypassMode::PullRequest => "pull_request",
+            BypassMode::Always => "always",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)] // Added Clone
@@ -178,6 +210,15 @@ impl Config {
             }
         }
 
+        Self::from_value(main_config, main_path)
+    }
+
+    /// Reads a config from YAML text; `main_path` names it in errors. Checked like a config file.
+    pub fn from_yaml_str(text: &str, main_path: &str) -> crate::error::AppResult<Self> {
+        Self::from_value(serde_yaml::from_str(text).map_err(crate::error::AppError::Serialization)?, main_path)
+    }
+
+    fn from_value(main_config: Value, main_path: &str) -> crate::error::AppResult<Self> {
         // Unknown or misplaced keys are refused, naming the file, where the key is and the keys allowed there.
         let config: Config = serde_path_to_error::deserialize(main_config)
             .map_err(|e| crate::error::AppError::Config(format!("{main_path}: {}: {}", e.path(), e.inner())))?;
@@ -188,6 +229,21 @@ impl Config {
             if let Some(dup) = checks.iter().enumerate().find_map(|(j, c)| checks.iter().take(j).any(|x| x == c).then_some(c)) {
                 return Err(crate::error::AppError::Config(format!(
                     "{main_path}: repos[{i}].required_checks (repo {}): `{dup}` is listed twice.",
+                    repo.name
+                )));
+            }
+            let bypass = &repo.required_checks_bypass;
+            let bypass_problem = if !bypass.is_empty() && checks.is_empty() {
+                Some("a bypass list needs `required_checks`: without them `sync` leaves the repo's rulesets alone.".to_string())
+            } else if let Some(dup) = bypass.iter().enumerate().find_map(|(j, b)| bypass.iter().take(j).any(|x| x.team == b.team).then_some(&b.team)) {
+                Some(format!("team `{dup}` is listed twice."))
+            } else {
+                let unknown = bypass.iter().find(|b| !config.teams.is_empty() && !config.teams.iter().any(|t| t.name == b.team));
+                unknown.map(|b| format!("team `{}` isn't one of the config's `teams`.", b.team))
+            };
+            if let Some(problem) = bypass_problem {
+                return Err(crate::error::AppError::Config(format!(
+                    "{main_path}: repos[{i}].required_checks_bypass (repo {}): {problem}",
                     repo.name
                 )));
             }
@@ -371,6 +427,29 @@ allow_force_pushes: false
         std::io::Write::write_all(&mut file, b"org: o\nrepos:\n- name: r\n  required_checks: [A, B, A]\n").unwrap();
         let err = Config::from_file_with_defaults(file.path().to_str().unwrap(), None).unwrap_err().to_string();
         assert!(err.contains("required_checks") && err.contains("`A` is listed twice"), "{err}");
+    }
+
+    #[test]
+    fn a_bypass_list_names_known_teams_once_with_a_known_mode_and_needs_checks() {
+        let load = |text: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+            Config::from_file_with_defaults(file.path().to_str().unwrap(), None).map_err(|e| e.to_string())
+        };
+        let teams = "teams:\n- name: core\n  members: []\n";
+        let ok = load(&format!("org: o\nrepos:\n- name: r\n  required_checks: [A]\n  required_checks_bypass:\n  - team: core\n    mode: pull_request\n{teams}")).unwrap();
+        assert_eq!(ok.repos[0].required_checks_bypass, [CheckBypass { team: "core".into(), mode: BypassMode::PullRequest }]);
+        for (bypass, expected) in [
+            ("[{team: core, mode: sometimes}]", "unknown variant `sometimes`"),
+            ("[{team: core, mode: always, why: x}]", "unknown field `why`"),
+            ("[{team: core, mode: always}, {team: core, mode: pull_request}]", "team `core` is listed twice"),
+            ("[{team: ghosts, mode: always}]", "team `ghosts` isn't one of the config's `teams`"),
+        ] {
+            let err = load(&format!("org: o\nrepos:\n- name: r\n  required_checks: [A]\n  required_checks_bypass: {bypass}\n{teams}")).unwrap_err();
+            assert!(err.contains("required_checks_bypass") && err.contains(expected), "{bypass}: {err}");
+        }
+        let err = load(&format!("org: o\nrepos:\n- name: r\n  required_checks_bypass: [{{team: core, mode: always}}]\n{teams}")).unwrap_err();
+        assert!(err.contains("needs `required_checks`"), "{err}");
     }
 
     #[test]

@@ -176,7 +176,7 @@ Every command refuses a config with a key it doesn't know before it contacts Git
 ```text
 config.yaml: repos[3].settings (repo old-tool): unknown setting `archive`. Did you mean `archived`? ...
 config.yaml: repos[3].settings (repo old-tool): `default_repository_permission` is not a repository setting: it would be sent to PATCH /orgs/{org}, which is not the repo. ...
-config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `use_default_webhook`, `webhook`, `branch_protections`, `required_checks`
+config.yaml: repos[3].archived: unknown field `archived`, expected one of `name`, `settings`, `visibility`, `use_default_webhook`, `webhook`, `branch_protections`, `required_checks`, `required_checks_bypass`
 ```
 
 **Example `config.yaml`:**
@@ -248,6 +248,9 @@ repos:
 repos:
   - name: service
     required_checks: [Format, Unit Tests, "Clippy & Docs"]
+    required_checks_bypass:       # optional: who may merge past the checks, and how
+      - team: core-team
+        mode: pull_request        # only by merging a PR; `always` also allows direct pushes
 ```
 
 - `sync` keeps them in the repo's own ruleset named `Require CI`: active, on the default branch (`~DEFAULT_BRANCH`), not strict (a PR needn't be up to date with the branch), one `required_status_checks` rule. It creates the ruleset if the repo has none by that name and rewrites it when its checks (in any order) or any of those properties differ. An existing `Require CI` ruleset is adopted by name.
@@ -255,9 +258,10 @@ repos:
 - `allow_auto_merge` is written after the repo's `Require CI` ruleset, so if the ruleset write fails, auto-merge isn't left on without the checks it waits for.
 - A name listed twice is refused when the config is loaded. A `Require CI` ruleset that requires one check twice (from different apps) is refused like one with another rule: a config can't say which pin to keep.
 - gh-config owns every rule in `Require CI`: if it holds any other rule, `sync` stops with an error naming the repo and the rule instead of dropping it. Keep other rules in other rulesets.
-- `sync --dry-run` names the checks an update would stop requiring.
+- `required_checks_bypass` is the ruleset's whole bypass list: `sync` makes it exactly these teams (by slug), so leaving it out removes every bypass, including the org's admins, apps and roles a ruleset can name but a config can't. `mode` is `pull_request` (merging a PR may skip the checks; a direct push may not) or `always`. A team that isn't in the config's `teams` (when it lists any), a team named twice, an unknown mode, or a bypass list without `required_checks` is refused when the config is loaded; `sync` creates the config's `teams` before it touches any repo, so a bypass list may name a team the same config adds. A team that neither the org nor the config's `teams` has is refused before `sync` writes anything.
+- `sync --dry-run` names the checks an update would stop requiring, who may bypass them after it and who no longer may.
 - A repo with no `required_checks` is left alone: `sync` doesn't read or delete its rulesets. To stop requiring checks, delete the ruleset on GitHub and the key.
-- `sync-from-org` records the checks of each repo's `Require CI` ruleset, in the file's order when the file names the same ones; `diff` compares them as a set. It costs one rulesets request per repo, plus one when `Require CI` exists. A ruleset that can't be read keeps what the file has, and `diff` names the repo and exits 1. Properties other than the checks aren't recorded, so `diff` shows no change when only those differ; `sync` still corrects them.
+- `sync-from-org` records the checks of each repo's `Require CI` ruleset, in the file's order when the file names the same ones; `diff` compares them as a set. It costs one rulesets request per repo, plus one when `Require CI` exists. A ruleset that can't be read keeps what the file has, and `diff` names the repo and exits 1. It records the bypass list too, reading team ids as slugs (one teams request in all). GitHub shows a ruleset's bypass list only to a token that can administer the repo; when it doesn't, or the list holds anything other than the org's teams, the file's list is kept and `diff` names the repo and exits 1. A ruleset that requires no checks is recorded without them and without a bypass list (a config can't hold a bypass list alone), and `sync-from-org` never writes a config that wouldn't load: it stops and leaves the file as it is. Properties other than the checks and the bypass list aren't recorded, so `diff` shows no change when only those differ; `sync` still corrects them.
 
 ### Webhooks
 

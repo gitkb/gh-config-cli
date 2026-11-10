@@ -53,6 +53,9 @@ repos:                            # (list) Repository configurations
     visibility: private           # (string, optional) "public" or "private"; required for sync to create a missing repo
     required_checks:              # (list, optional) Checks a PR to the default branch must pass (ruleset `Require CI`)
       - Unit Tests
+    required_checks_bypass:       # (list, optional) The only teams that may merge past required_checks
+      - team: core-team           # (string) Team slug
+        mode: pull_request        # (string) pull_request (by merging a PR) or always (also direct pushes)
     webhook:                      # (object, optional) This repo's own webhook
       url: "http://example.com"   # (string) Webhook endpoint URL
       content_type: "json"        # (string) Payload content type
