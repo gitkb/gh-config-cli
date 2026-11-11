@@ -32,6 +32,70 @@ const ACCESS_LEVEL: &str = "access_level";
 /// The repo ruleset `required_checks` is kept in. gh-config owns every rule in it.
 const REQUIRE_CI: &str = "Require CI";
 const REQUIRED_STATUS_CHECKS: &str = "required_status_checks";
+/// The repo ruleset `required_approvals` is kept in. gh-config owns every rule in it.
+const REQUIRE_REVIEW: &str = "Require review";
+const PULL_REQUEST: &str = "pull_request";
+
+/// A repo's `Require review` ruleset as GitHub holds it.
+struct RequireReview {
+    id: u64,
+    approvals: u32,
+    /// Whether everything but the count is what `sync` writes.
+    standard: bool,
+}
+
+/// The `Require review` ruleset `sync` writes: PRs to the default branch need `approvals` approving reviews. The other
+/// review settings are off here; a stricter one in another ruleset (the org's) still applies, GitHub takes the strictest.
+fn require_review_body(approvals: u32) -> serde_json::Value {
+    json!({
+        "name": REQUIRE_REVIEW,
+        "target": "branch",
+        "enforcement": "active",
+        "bypass_actors": [],
+        "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+        "rules": [{
+            "type": PULL_REQUEST,
+            "parameters": {
+                "required_approving_review_count": approvals,
+                "dismiss_stale_reviews_on_push": false,
+                "require_code_owner_review": false,
+                "require_last_push_approval": false,
+                "required_review_thread_resolution": false,
+            },
+        }],
+    })
+}
+
+/// Reads a `Require review` ruleset. Any rule but one pull request rule is refused: `sync` would drop it.
+fn parse_require_review(repo: &str, ruleset: &serde_json::Value) -> AppResult<RequireReview> {
+    let id = ruleset["id"].as_u64().ok_or_else(|| AppError::GitHubApi(format!("Repo {repo}: the `{REQUIRE_REVIEW}` ruleset has no id")))?;
+    let rules = ruleset["rules"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let [rule] = rules else {
+        return Err(AppError::GitHubApi(format!(
+            "Repo {repo}: its `{REQUIRE_REVIEW}` ruleset holds {} rules; gh-config owns it and writes one pull_request rule: move the others to another ruleset first.",
+            rules.len()
+        )));
+    };
+    if rule["type"] != PULL_REQUEST {
+        return Err(AppError::GitHubApi(format!(
+            "Repo {repo}: its `{REQUIRE_REVIEW}` ruleset holds a `{}` rule; gh-config owns it and would drop the rule: move it to another ruleset first.",
+            rule["type"].as_str().unwrap_or("?")
+        )));
+    }
+    let p = &rule["parameters"];
+    let approvals = p["required_approving_review_count"].as_u64().and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| AppError::GitHubApi(format!("Repo {repo}: its `{REQUIRE_REVIEW}` ruleset has no review count")))?;
+    let ref_name = &ruleset["conditions"]["ref_name"];
+    let standard = ruleset["target"] == "branch"
+        && ruleset["enforcement"] == "active"
+        && ruleset["bypass_actors"].as_array().is_some_and(Vec::is_empty)
+        && ref_name["include"] == json!(["~DEFAULT_BRANCH"])
+        && ref_name["exclude"].as_array().is_some_and(Vec::is_empty)
+        && ["dismiss_stale_reviews_on_push", "require_code_owner_review", "require_last_push_approval", "required_review_thread_resolution"]
+            .iter()
+            .all(|k| p[*k] == false);
+    Ok(RequireReview { id, approvals, standard })
+}
 
 /// Settings a generated config writes only when they aren't GitHub's default, with that default. `diff` gives
 /// GitHub's side the default of each one a config names, so writing the default out is no difference.
@@ -498,15 +562,57 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// The repo's own rulesets, by name and id: one list request.
+    async fn list_rulesets(&self, repo: &str) -> AppResult<Vec<RulesetSummary>> {
+        self.get_all(&format!("{}/repos/{}/{}/rulesets?includes_parents=false&per_page=100", self.api_url, self.org, repo)).await
+    }
+
+    /// The repo's own ruleset named `name` among `rulesets`, read in full: one request when it exists.
+    async fn read_ruleset(&self, repo: &str, rulesets: &[RulesetSummary], name: &str) -> AppResult<Option<serde_json::Value>> {
+        let Some(found) = rulesets.iter().find(|r| r.name == name) else { return Ok(None) };
+        let url = format!("{}/repos/{}/{}/rulesets/{}", self.api_url, self.org, repo, found.id);
+        serde_json::from_str(&self.get(&url).await?.text().await?)
+            .map(Some)
+            .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", url, e)))
+    }
+
     /// The repo's own `Require CI` ruleset, if it has one: one list request, plus one for its rules when it exists.
     async fn read_require_ci(&self, repo: &str) -> AppResult<Option<RequireCi>> {
-        let list = format!("{}/repos/{}/{}/rulesets?includes_parents=false&per_page=100", self.api_url, self.org, repo);
-        let rulesets: Vec<RulesetSummary> = self.get_all(&list).await?;
-        let Some(found) = rulesets.into_iter().find(|r| r.name == REQUIRE_CI) else { return Ok(None) };
-        let url = format!("{}/repos/{}/{}/rulesets/{}", self.api_url, self.org, repo, found.id);
-        let ruleset: serde_json::Value = serde_json::from_str(&self.get(&url).await?.text().await?)
-            .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", url, e)))?;
-        parse_require_ci(repo, &ruleset).map(Some)
+        let rulesets = self.list_rulesets(repo).await?;
+        self.read_ruleset(repo, &rulesets, REQUIRE_CI).await?.map(|r| parse_require_ci(repo, &r)).transpose()
+    }
+
+    /// The repo's `Require CI` and `Require review` rulesets, raw, from one list request.
+    async fn read_owned_rulesets(&self, repo: &str) -> AppResult<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+        let rulesets = self.list_rulesets(repo).await?;
+        Ok((self.read_ruleset(repo, &rulesets, REQUIRE_CI).await?, self.read_ruleset(repo, &rulesets, REQUIRE_REVIEW).await?))
+    }
+
+    /// The repo's own `Require review` ruleset, if it has one.
+    async fn read_require_review(&self, repo: &str) -> AppResult<Option<RequireReview>> {
+        let rulesets = self.list_rulesets(repo).await?;
+        self.read_ruleset(repo, &rulesets, REQUIRE_REVIEW).await?.map(|r| parse_require_review(repo, &r)).transpose()
+    }
+
+    /// Makes the repo's `Require review` ruleset require exactly `repo.required_approvals`. A repo without it is left alone.
+    async fn sync_required_approvals(&self, repo: &Repo, dry_run: bool) -> AppResult<()> {
+        let Some(approvals) = repo.required_approvals else { return Ok(()) };
+        let current = self.read_require_review(&repo.name).await?;
+        let held = current.as_ref().map(|c| c.approvals);
+        let (method, url) = match current {
+            Some(current) if current.standard && current.approvals == approvals => return Ok(()),
+            Some(current) => (Method::PUT, format!("{}/repos/{}/{}/rulesets/{}", self.api_url, self.org, repo.name, current.id)),
+            None => (Method::POST, format!("{}/repos/{}/{}/rulesets", self.api_url, self.org, repo.name)),
+        };
+        if dry_run {
+            let verb = if method == Method::POST { "create" } else { "update" };
+            let was = held.map(|n| format!(" (now {n})")).unwrap_or_default();
+            println!("[Dry Run] Would {verb} ruleset `{REQUIRE_REVIEW}` on {}/{} requiring {approvals} approving review(s){was}", self.org, repo.name);
+            return Ok(());
+        }
+        self.client.request(method, &url, "application/vnd.github+json", Some(require_review_body(approvals))).await?;
+        info!("Ruleset `{REQUIRE_REVIEW}` on {}/{} now requires {approvals} approving review(s)", self.org, repo.name);
+        Ok(())
     }
 
     /// The org's teams as `(slug, id)`.
@@ -1095,6 +1201,9 @@ impl GitHubClient {
                         yaml_content.push_str(&format!("  - {}\n", serde_yaml::to_string(check)?.trim()));
                     }
                 }
+                if let Some(approvals) = repo.required_approvals {
+                    yaml_content.push_str(&format!("  required_approvals: {approvals}\n"));
+                }
                 if !repo.required_checks_bypass.is_empty() {
                     yaml_content.push_str("  required_checks_bypass:\n");
                     for bypass in &repo.required_checks_bypass {
@@ -1236,7 +1345,14 @@ impl GitHubClient {
             };
             let file_checks = in_file.map(|r| r.required_checks.clone()).unwrap_or_default();
             let file_bypass = in_file.map(|r| r.required_checks_bypass.clone()).unwrap_or_default();
-            let (required_checks, required_checks_bypass) = match self.read_require_ci(&name).await {
+            // One list of the repo's rulesets for both: a read that fails leaves both as the file has them.
+            let (ci, review) = match self.read_owned_rulesets(&name).await {
+                Ok((ci, review)) => (Ok(ci), Ok(review)),
+                Err(e) => (Err(AppError::GitHubApi(e.to_string())), Err(AppError::GitHubApi(e.to_string()))),
+            };
+            let ci = ci.and_then(|r| r.map(|r| parse_require_ci(&name, &r)).transpose());
+            let review = review.and_then(|r| r.map(|r| parse_require_review(&name, &r)).transpose());
+            let (required_checks, required_checks_bypass) = match ci {
                 Ok(found) => {
                     // The file's order when it names the same checks, so regenerating doesn't reorder them.
                     let checks = match found.as_ref().map(RequireCi::contexts).unwrap_or_default() {
@@ -1274,6 +1390,14 @@ impl GitHubClient {
                 }
             };
 
+            let required_approvals = match review {
+                Ok(found) => found.map(|r| r.approvals),
+                Err(e) => {
+                    error!("Failed to read the `{}` ruleset of repo {}: {}. Its required approvals stay as the file has them.", REQUIRE_REVIEW, name, e);
+                    unread.push(format!("{name} (required approvals)"));
+                    in_file.and_then(|r| r.required_approvals)
+                }
+            };
             repos.push(Repo {
                 name,
                 settings,
@@ -1283,6 +1407,7 @@ impl GitHubClient {
                 branch_protections: vec![], // Add logic to fetch these if needed
                 required_checks,
                 required_checks_bypass,
+                required_approvals,
             });
         }
 
@@ -1421,6 +1546,7 @@ impl GitHubClient {
                 self.manage_webhooks(&repo.name, webhook, dry_run).await?;
             }
             self.sync_required_checks(repo, &teams, dry_run).await?;
+            self.sync_required_approvals(repo, dry_run).await?;
             self.update_repo_settings(repo, &current, |k| k == ALLOW_AUTO_MERGE, dry_run).await?;
         }
 
@@ -2630,6 +2756,85 @@ assignments:
         let config = Config::from_file_with_defaults(path, None).expect("the exported config doesn't load");
         let repo = config.repos.iter().find(|r| r.name == "r").expect("repo r");
         assert!(repo.required_checks.is_empty() && repo.required_checks_bypass.is_empty(), "{repo:?}");
+    }
+
+    fn require_review(id: u64, approvals: u32) -> serde_json::Value {
+        let mut ruleset = require_review_body(approvals);
+        ruleset["id"] = json!(id);
+        ruleset
+    }
+
+    #[tokio::test]
+    async fn required_approvals_creates_require_review_and_leaves_require_ci_alone() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_full(&mut server, &[("r", json!({}))], |_| json!([]), |_| Some(vec![])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _post = record(&mut server, &writes, "POST", "/repos/o/r/rulesets").await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_approvals: 1\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).sync(path, true).await.expect("dry run");
+        assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
+        client(&server).sync(path, false).await.expect("sync");
+        let writes = writes.lock().expect("lock");
+        let [post] = writes.as_slice() else { panic!("{writes:?}") };
+        let sent: serde_json::Value = serde_json::from_str(post.trim_start_matches("POST /repos/o/r/rulesets ")).expect("json body");
+        assert_eq!(sent["name"], "Require review");
+        assert_eq!(sent["rules"].as_array().map(Vec::len), Some(1));
+        assert_eq!(sent["rules"][0]["type"], "pull_request");
+        assert_eq!(sent["rules"][0]["parameters"]["required_approving_review_count"], 1);
+        assert_eq!(sent["bypass_actors"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn required_approvals_round_trip_and_a_matching_ruleset_is_not_rewritten() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_full(&mut server, &[("r", json!({})), ("open", json!({}))], |_| json!([]), |name| {
+            Some(if name == "r" { vec![json!({"id": 1, "name": "Other"}), require_review(4, 2)] } else { vec![] })
+        }).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _put = record(&mut server, &writes, "PUT", "/repos/o/r/rulesets/4").await;
+        let file = write_file("org: o\nrepos:\n- name: r\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(repo_block(&yaml, "r").contains("  required_approvals: 2\n"), "{yaml}");
+        assert!(!repo_block(&yaml, "open").contains("required_approvals"), "{yaml}");
+        assert!(!client(&server).diff(path).await.expect("diff"), "the exported config doesn't match what it was read from");
+        client(&server).sync(path, false).await.expect("sync");
+        assert!(writes.lock().expect("lock").is_empty(), "a matching ruleset was rewritten");
+    }
+
+    #[tokio::test]
+    async fn an_adopted_require_review_is_rewritten_to_the_config_and_other_rules_are_refused() {
+        let mut server = mockito::Server::new_async().await;
+        let mut adopted = require_review(4, 0);
+        adopted["rules"][0]["parameters"]["require_code_owner_review"] = json!(true);
+        let mut mixed = require_review(5, 1);
+        mixed["rules"].as_array_mut().expect("rules").push(json!({"type": "deletion"}));
+        let _mocks = mock_org_full(&mut server, &[("adopt", json!({})), ("mixed", json!({}))], |_| json!([]), |name| {
+            Some(vec![if name == "adopt" { adopted.clone() } else { mixed.clone() }])
+        }).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _put = record(&mut server, &writes, "PUT", "/repos/o/adopt/rulesets/4").await;
+        let file = write_file("org: o\nrepos:\n- name: adopt\n  required_approvals: 1\n");
+        client(&server).sync(file.path().to_str().expect("utf-8 path"), false).await.expect("sync");
+        assert_eq!(*writes.lock().expect("lock"), [format!("PUT /repos/o/adopt/rulesets/4 {}", require_review_body(1))]);
+        let file = write_file("org: o\nrepos:\n- name: mixed\n  required_approvals: 1\n");
+        let err = client(&server).sync(file.path().to_str().expect("utf-8 path"), false).await.expect_err("dropped a rule");
+        assert!(err.to_string().contains("mixed") && err.to_string().contains("2 rules"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn required_approvals_that_cant_be_read_keep_the_files_and_are_never_a_clean_diff() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_full(&mut server, &[("r", json!({}))], |_| json!([]), |_| None).await;
+        let _list = server.mock("GET", "/repos/o/r/rulesets?includes_parents=false&per_page=100")
+            .with_body(r#"[{"id": 5, "name": "Require review"}]"#).create_async().await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_approvals: 1\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        assert!(repo_block(&std::fs::read_to_string(path).expect("read export"), "r").contains("  required_approvals: 1\n"));
+        assert!(client(&server).diff(path).await.expect("diff"), "diff called approvals it never read a match");
     }
 
     #[tokio::test]

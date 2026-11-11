@@ -92,6 +92,10 @@ pub struct Repo {
     /// bypass list exactly this, so leaving it out removes every bypass. Needs `required_checks`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_checks_bypass: Vec<CheckBypass>,
+    /// Approving reviews a PR to the default branch needs (1-10), held in the repo's `Require review` ruleset.
+    /// Left out: `sync` leaves that ruleset alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_approvals: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -229,6 +233,12 @@ impl Config {
             if let Some(dup) = checks.iter().enumerate().find_map(|(j, c)| checks.iter().take(j).any(|x| x == c).then_some(c)) {
                 return Err(crate::error::AppError::Config(format!(
                     "{main_path}: repos[{i}].required_checks (repo {}): `{dup}` is listed twice.",
+                    repo.name
+                )));
+            }
+            if let Some(n) = repo.required_approvals.filter(|n| !(1..=10).contains(n)) {
+                return Err(crate::error::AppError::Config(format!(
+                    "{main_path}: repos[{i}].required_approvals (repo {}): GitHub takes 1-10 approving reviews, got {n}; leave the key out for none.",
                     repo.name
                 )));
             }
@@ -427,6 +437,21 @@ allow_force_pushes: false
         std::io::Write::write_all(&mut file, b"org: o\nrepos:\n- name: r\n  required_checks: [A, B, A]\n").unwrap();
         let err = Config::from_file_with_defaults(file.path().to_str().unwrap(), None).unwrap_err().to_string();
         assert!(err.contains("required_checks") && err.contains("`A` is listed twice"), "{err}");
+    }
+
+    #[test]
+    fn required_approvals_is_one_to_ten() {
+        let load = |text: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+            Config::from_file_with_defaults(file.path().to_str().unwrap(), None).map_err(|e| e.to_string())
+        };
+        assert_eq!(load("org: o\nrepos:\n- name: r\n  required_approvals: 1\n").unwrap().repos[0].required_approvals, Some(1));
+        for n in ["0", "11"] {
+            let err = load(&format!("org: o\nrepos:\n- name: r\n  required_approvals: {n}\n")).unwrap_err();
+            assert!(err.contains("required_approvals") && err.contains("1-10"), "{n}: {err}");
+        }
+        assert!(load("org: o\nrepos:\n- name: r\n  required_approvals: one\n").is_err());
     }
 
     #[test]
