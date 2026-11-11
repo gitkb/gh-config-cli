@@ -51,6 +51,7 @@ repos:                            # (list) Repository configurations
       allow_auto_merge: true      # (bool) Let PRs merge themselves once required checks pass
       access_level: organization  # (string, private repos only) Who may call this repo's workflows: none, user, organization
     visibility: private           # (string, optional) "public" or "private"; required for sync to create a missing repo
+    required_approvals: 1         # (integer 1-10, optional) Approving reviews a PR to the default branch needs (ruleset `Require review`)
     required_checks:              # (list, optional) Checks a PR to the default branch must pass (ruleset `Require CI`)
       - Unit Tests
     required_checks_bypass:       # (list, optional) The only teams that may merge past required_checks
