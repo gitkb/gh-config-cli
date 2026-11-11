@@ -9,7 +9,7 @@
     Public APIs are documented for maintainability. Internal response structs are used for deserialization.
 */
 
-use crate::config::{Assignment, BypassMode, CheckBypass, Repo, RepoSettings, Team, User, WebhookConfig, Config};
+use crate::config::{Assignment, BypassMode, CheckBypass, MergeGrouping, MergeMethod, MergeQueue, Repo, RepoSettings, Team, User, WebhookConfig, Config};
 use crate::error::{AppError, AppResult};
 use colored::*;
 use log::{debug, info, error};
@@ -32,6 +32,55 @@ const ACCESS_LEVEL: &str = "access_level";
 /// The repo ruleset `required_checks` is kept in. gh-config owns every rule in it.
 const REQUIRE_CI: &str = "Require CI";
 const REQUIRED_STATUS_CHECKS: &str = "required_status_checks";
+const MERGE_QUEUE: &str = "merge_queue";
+
+/// The `merge_queue` rule's parameters, as GitHub takes them.
+fn merge_queue_parameters(queue: &MergeQueue) -> serde_json::Value {
+    let method = match queue.merge_method {
+        MergeMethod::Merge => "MERGE",
+        MergeMethod::Squash => "SQUASH",
+        MergeMethod::Rebase => "REBASE",
+    };
+    let grouping = match queue.grouping {
+        MergeGrouping::Allgreen => "ALLGREEN",
+        MergeGrouping::Headgreen => "HEADGREEN",
+    };
+    json!({
+        "merge_method": method,
+        "grouping_strategy": grouping,
+        "max_entries_to_build": queue.max_entries_to_build,
+        "min_entries_to_merge": queue.min_entries_to_merge,
+        "max_entries_to_merge": queue.max_entries_to_merge,
+        "min_entries_to_merge_wait_minutes": queue.min_entries_to_merge_wait_minutes,
+        "check_response_timeout_minutes": queue.check_response_timeout_minutes,
+    })
+}
+
+/// A `merge_queue` rule's parameters as a config entry; a value a config can't name is refused.
+fn parse_merge_queue(repo: &str, params: &serde_json::Value) -> AppResult<MergeQueue> {
+    let refused = |what: &str| AppError::GitHubApi(format!("Repo {repo}: its `{REQUIRE_CI}` merge queue has {what}, which a config can't name"));
+    let number = |key: &str| params[key].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| refused(&format!("no {key}")));
+    let merge_method = match params["merge_method"].as_str() {
+        Some("MERGE") => MergeMethod::Merge,
+        Some("SQUASH") => MergeMethod::Squash,
+        Some("REBASE") => MergeMethod::Rebase,
+        other => return Err(refused(&format!("merge_method {other:?}"))),
+    };
+    let grouping = match params["grouping_strategy"].as_str() {
+        Some("ALLGREEN") => MergeGrouping::Allgreen,
+        Some("HEADGREEN") => MergeGrouping::Headgreen,
+        other => return Err(refused(&format!("grouping_strategy {other:?}"))),
+    };
+    Ok(MergeQueue {
+        merge_method,
+        grouping,
+        max_entries_to_build: number("max_entries_to_build")?,
+        min_entries_to_merge: number("min_entries_to_merge")?,
+        max_entries_to_merge: number("max_entries_to_merge")?,
+        min_entries_to_merge_wait_minutes: number("min_entries_to_merge_wait_minutes")?,
+        check_response_timeout_minutes: number("check_response_timeout_minutes")?,
+    })
+}
 
 /// Settings a generated config writes only when they aren't GitHub's default, with that default. `diff` gives
 /// GitHub's side the default of each one a config names, so writing the default out is no difference.
@@ -117,12 +166,31 @@ fn bypass_change(bypass: &[BypassActor], held: Option<&[BypassActor]>, exists: b
     format!("bypass: {allowed}{dropped}")
 }
 
+/// The merge-queue part of a dry run's line, empty when it doesn't change.
+fn queue_change(wanted: Option<&MergeQueue>, held: Option<&MergeQueue>) -> String {
+    let named = |q: &MergeQueue| {
+        format!(
+            "{:?} merge, {:?} groups of {}-{} (waiting {} min), {} built at once, checks time out after {} min",
+            q.merge_method, q.grouping, q.min_entries_to_merge, q.max_entries_to_merge, q.min_entries_to_merge_wait_minutes,
+            q.max_entries_to_build, q.check_response_timeout_minutes
+        )
+        .to_lowercase()
+    };
+    match (wanted, held) {
+        (a, b) if a == b => String::new(),
+        (Some(q), _) => format!("; merge queue: {}", named(q)),
+        (None, Some(_)) => "; merge queue removed".to_string(),
+        (None, None) => String::new(),
+    }
+}
+
 /// A repo's `Require CI` ruleset as GitHub holds it.
 struct RequireCi {
     id: u64,
     checks: Vec<RequiredCheck>,
     /// Sorted. `None` when GitHub didn't say: it shows a ruleset's bypass list only to tokens that can administer the repo.
     bypass: Option<Vec<BypassActor>>,
+    merge_queue: Option<MergeQueue>,
     /// Whether everything but the checks is what `sync` writes: active, on the default branch, not strict.
     standard: bool,
 }
@@ -133,8 +201,9 @@ impl RequireCi {
     }
 }
 
-/// The `Require CI` ruleset `sync` writes for `checks`, which only `bypass` may merge past.
-fn require_ci_body(checks: &[RequiredCheck], bypass: &[BypassActor]) -> serde_json::Value {
+/// The `Require CI` ruleset `sync` writes for `checks`, which only `bypass` may merge past, with `merge_queue`
+/// when there is one.
+fn require_ci_body(checks: &[RequiredCheck], bypass: &[BypassActor], merge_queue: Option<&MergeQueue>) -> serde_json::Value {
     let bypass: Vec<_> = bypass
         .iter()
         .map(|a| match a.actor_id {
@@ -149,33 +218,44 @@ fn require_ci_body(checks: &[RequiredCheck], bypass: &[BypassActor]) -> serde_js
             None => json!({ "context": c.context }),
         })
         .collect();
+    let mut rules = vec![json!({
+        "type": REQUIRED_STATUS_CHECKS,
+        "parameters": {
+            "required_status_checks": checks,
+            "strict_required_status_checks_policy": false,
+            "do_not_enforce_on_create": false,
+        },
+    })];
+    if let Some(queue) = merge_queue {
+        rules.push(json!({ "type": MERGE_QUEUE, "parameters": merge_queue_parameters(queue) }));
+    }
     json!({
         "name": REQUIRE_CI,
         "target": "branch",
         "enforcement": "active",
         "bypass_actors": bypass,
         "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
-        "rules": [{
-            "type": REQUIRED_STATUS_CHECKS,
-            "parameters": {
-                "required_status_checks": checks,
-                "strict_required_status_checks_policy": false,
-                "do_not_enforce_on_create": false,
-            },
-        }],
+        "rules": rules,
     })
 }
 
-/// Reads a `Require CI` ruleset. A rule other than required status checks is refused: `sync` would drop it.
+/// Reads a `Require CI` ruleset. A rule other than required status checks and the merge queue is refused:
+/// `sync` would drop it.
 fn parse_require_ci(repo: &str, ruleset: &serde_json::Value) -> AppResult<RequireCi> {
     let id = ruleset["id"].as_u64().ok_or_else(|| AppError::GitHubApi(format!("Repo {repo}: the `{REQUIRE_CI}` ruleset has no id")))?;
     let rules = ruleset["rules"].as_array().map(Vec::as_slice).unwrap_or_default();
-    if let Some(other) = rules.iter().map(|r| r["type"].as_str().unwrap_or("?")).find(|t| *t != REQUIRED_STATUS_CHECKS) {
+    if let Some(other) = rules.iter().map(|r| r["type"].as_str().unwrap_or("?")).find(|t| *t != REQUIRED_STATUS_CHECKS && *t != MERGE_QUEUE) {
         return Err(AppError::GitHubApi(format!(
             "Repo {repo}: its `{REQUIRE_CI}` ruleset also holds a `{other}` rule. gh-config owns that ruleset and would drop the rule: move the rule to another ruleset first."
         )));
     }
-    let params = rules.first().map(|r| &r["parameters"]);
+    let of_type = |t: &str| rules.iter().filter(|r| r["type"] == t).collect::<Vec<_>>();
+    let (check_rules, queue_rules) = (of_type(REQUIRED_STATUS_CHECKS), of_type(MERGE_QUEUE));
+    if check_rules.len() > 1 || queue_rules.len() > 1 {
+        return Err(AppError::GitHubApi(format!("Repo {repo}: its `{REQUIRE_CI}` ruleset holds a rule type twice, which a config can't name")));
+    }
+    let merge_queue = queue_rules.first().map(|r| parse_merge_queue(repo, &r["parameters"])).transpose()?;
+    let params = check_rules.first().map(|r| &r["parameters"]);
     let checks = params
         .and_then(|p| p["required_status_checks"].as_array())
         .map(|checks| {
@@ -195,7 +275,7 @@ fn parse_require_ci(repo: &str, ruleset: &serde_json::Value) -> AppResult<Requir
         )));
     }
     let ref_name = &ruleset["conditions"]["ref_name"];
-    let standard = rules.len() == 1
+    let standard = check_rules.len() == 1
         && ruleset["target"] == "branch"
         && ruleset["enforcement"] == "active"
         && ref_name["include"] == json!(["~DEFAULT_BRANCH"])
@@ -213,7 +293,7 @@ fn parse_require_ci(repo: &str, ruleset: &serde_json::Value) -> AppResult<Requir
         actors.sort();
         actors
     });
-    Ok(RequireCi { id, checks, bypass, standard })
+    Ok(RequireCi { id, checks, bypass, merge_queue, standard })
 }
 
 /// Whether two check lists hold the same names, in any order.
@@ -537,8 +617,16 @@ impl GitHubClient {
             .map(|name| held.iter().find(|c| &c.context == name).cloned().unwrap_or(RequiredCheck { context: name.clone(), integration_id: None }))
             .collect();
         let held_bypass = current.as_ref().and_then(|c| c.bypass.clone());
+        let held_queue = current.as_ref().and_then(|c| c.merge_queue.clone());
         let (method, url) = match current {
-            Some(current) if current.standard && same_checks(&current.contexts(), checks) && current.bypass.as_ref() == Some(&bypass) => return Ok(()),
+            Some(current)
+                if current.standard
+                    && same_checks(&current.contexts(), checks)
+                    && current.bypass.as_ref() == Some(&bypass)
+                    && current.merge_queue == repo.merge_queue =>
+            {
+                return Ok(())
+            }
             Some(current) => (Method::PUT, format!("{}/repos/{}/{}/rulesets/{}", self.api_url, self.org, repo.name, current.id)),
             None => (Method::POST, format!("{}/repos/{}/{}/rulesets", self.api_url, self.org, repo.name)),
         };
@@ -547,10 +635,11 @@ impl GitHubClient {
             let removed: Vec<_> = held.iter().map(|c| c.context.as_str()).filter(|c| !checks.iter().any(|n| n == c)).collect();
             let removed = if removed.is_empty() { String::new() } else { format!("; no longer requiring: {}", removed.join(", ")) };
             let bypass = bypass_change(&bypass, held_bypass.as_deref(), method == Method::PUT, teams);
-            println!("[Dry Run] Would {verb} ruleset `{REQUIRE_CI}` on {}/{} requiring: {}{removed}; {bypass}", self.org, repo.name, checks.join(", "));
+            let queue = queue_change(repo.merge_queue.as_ref(), held_queue.as_ref());
+            println!("[Dry Run] Would {verb} ruleset `{REQUIRE_CI}` on {}/{} requiring: {}{removed}; {bypass}{queue}", self.org, repo.name, checks.join(", "));
             return Ok(());
         }
-        self.client.request(method, &url, "application/vnd.github+json", Some(require_ci_body(&desired, &bypass))).await?;
+        self.client.request(method, &url, "application/vnd.github+json", Some(require_ci_body(&desired, &bypass, repo.merge_queue.as_ref()))).await?;
         info!("Ruleset `{REQUIRE_CI}` on {}/{} now requires: {}; bypass: {}", self.org, repo.name, checks.join(", "), bypass.len());
         Ok(())
     }
@@ -1095,6 +1184,13 @@ impl GitHubClient {
                         yaml_content.push_str(&format!("  - {}\n", serde_yaml::to_string(check)?.trim()));
                     }
                 }
+                if let Some(queue) = &repo.merge_queue {
+                    yaml_content.push_str("  merge_queue:\n");
+                    let fields = serde_yaml::to_string(queue)?;
+                    for line in fields.lines() {
+                        yaml_content.push_str(&format!("    {line}\n"));
+                    }
+                }
                 if !repo.required_checks_bypass.is_empty() {
                     yaml_content.push_str("  required_checks_bypass:\n");
                     for bypass in &repo.required_checks_bypass {
@@ -1236,7 +1332,8 @@ impl GitHubClient {
             };
             let file_checks = in_file.map(|r| r.required_checks.clone()).unwrap_or_default();
             let file_bypass = in_file.map(|r| r.required_checks_bypass.clone()).unwrap_or_default();
-            let (required_checks, required_checks_bypass) = match self.read_require_ci(&name).await {
+            let file_queue = in_file.and_then(|r| r.merge_queue.clone());
+            let (required_checks, required_checks_bypass, merge_queue) = match self.read_require_ci(&name).await {
                 Ok(found) => {
                     // The file's order when it names the same checks, so regenerating doesn't reorder them.
                     let checks = match found.as_ref().map(RequireCi::contexts).unwrap_or_default() {
@@ -1265,12 +1362,13 @@ impl GitHubClient {
                     // A config without checks leaves the ruleset alone, so a bypass list there would mean nothing:
                     // the loader refuses one.
                     let bypass = if checks.is_empty() { Vec::new() } else { bypass };
-                    (checks, bypass)
+                    let queue = found.as_ref().and_then(|r| r.merge_queue.clone()).filter(|_| !checks.is_empty());
+                    (checks, bypass, queue)
                 }
                 Err(e) => {
                     error!("Failed to read the `{}` ruleset of repo {}: {}. Its required checks stay as the file has them.", REQUIRE_CI, name, e);
                     unread.push(format!("{name} (required checks)"));
-                    (file_checks, file_bypass)
+                    (file_checks, file_bypass, file_queue)
                 }
             };
 
@@ -1283,6 +1381,7 @@ impl GitHubClient {
                 branch_protections: vec![], // Add logic to fetch these if needed
                 required_checks,
                 required_checks_bypass,
+                merge_queue,
             });
         }
 
@@ -1733,7 +1832,7 @@ mod tests {
 
     /// A `Require CI` ruleset with id `id` requiring `checks`, as `sync` writes it.
     fn require_ci(id: u64, checks: &[&str]) -> serde_json::Value {
-        let mut ruleset = require_ci_body(&unpinned(checks), &[]);
+        let mut ruleset = require_ci_body(&unpinned(checks), &[], None);
         ruleset["id"] = json!(id);
         ruleset
     }
@@ -2286,7 +2385,7 @@ assignments:
         client(&server).sync(path, true).await.expect("dry run");
         assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
         client(&server).sync(path, false).await.expect("sync");
-        let body = |checks: &[&str]| require_ci_body(&unpinned(checks), &[]).to_string();
+        let body = |checks: &[&str]| require_ci_body(&unpinned(checks), &[], None).to_string();
         assert_eq!(
             *writes.lock().expect("lock"),
             [format!("POST /repos/o/fresh/rulesets {}", body(&["A", "Clippy & Docs"])), format!("PUT /repos/o/adopt/rulesets/7 {}", body(&["A", "B"]))]
@@ -2630,6 +2729,108 @@ assignments:
         let config = Config::from_file_with_defaults(path, None).expect("the exported config doesn't load");
         let repo = config.repos.iter().find(|r| r.name == "r").expect("repo r");
         assert!(repo.required_checks.is_empty() && repo.required_checks_bypass.is_empty(), "{repo:?}");
+    }
+
+    fn squash_queue() -> MergeQueue {
+        MergeQueue {
+            merge_method: MergeMethod::Squash,
+            grouping: MergeGrouping::Allgreen,
+            max_entries_to_build: 5,
+            min_entries_to_merge: 1,
+            max_entries_to_merge: 5,
+            min_entries_to_merge_wait_minutes: 5,
+            check_response_timeout_minutes: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_merge_queue_is_written_into_require_ci_after_its_checks() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_with_teams(&mut server, &[], &[("r", json!({}))], |_| json!([]), |_| Some(vec![])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _post = record(&mut server, &writes, "POST", "/repos/o/r/rulesets").await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_checks: [CI gate]\n  merge_queue: {merge_method: squash}\n");
+        client(&server).sync(file.path().to_str().expect("utf-8 path"), false).await.expect("sync");
+        let writes = writes.lock().expect("lock");
+        let [post] = writes.as_slice() else { panic!("{writes:?}") };
+        let sent: serde_json::Value = serde_json::from_str(post.trim_start_matches("POST /repos/o/r/rulesets ")).expect("json body");
+        assert_eq!(sent["rules"][0]["type"], "required_status_checks");
+        assert_eq!(sent["rules"][1], json!({"type": "merge_queue", "parameters": {
+            "merge_method": "SQUASH", "grouping_strategy": "ALLGREEN", "max_entries_to_build": 5, "min_entries_to_merge": 1,
+            "max_entries_to_merge": 5, "min_entries_to_merge_wait_minutes": 5, "check_response_timeout_minutes": 60}}));
+    }
+
+    #[tokio::test]
+    async fn a_merge_queue_round_trips_and_a_matching_one_is_not_rewritten() {
+        let mut server = mockito::Server::new_async().await;
+        let mut ruleset = require_a_with(5, Some(json!([])));
+        let mut queue = squash_queue();
+        queue.grouping = MergeGrouping::Headgreen;
+        queue.max_entries_to_merge = 3;
+        ruleset["rules"].as_array_mut().expect("rules").push(json!({"type": "merge_queue", "parameters": merge_queue_parameters(&queue)}));
+        let _mocks = mock_org_with_teams(&mut server, &[], &[("r", json!({}))], |_| json!([]), |_| Some(vec![ruleset.clone()])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _put = record(&mut server, &writes, "PUT", "/repos/o/r/rulesets/5").await;
+        let file = write_file("org: o\nrepos:\n- name: r\n  required_checks: [A]\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("export");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(repo_block(&yaml, "r").contains("  merge_queue:\n    merge_method: squash\n    grouping: headgreen\n"), "{yaml}");
+        let exported = Config::from_file_with_defaults(path, None).expect("the export loads");
+        assert_eq!(exported.repos.iter().find(|r| r.name == "r").and_then(|r| r.merge_queue.clone()), Some(queue));
+        assert!(!client(&server).diff(path).await.expect("diff"), "the exported config doesn't match what it was read from");
+        client(&server).sync(path, false).await.expect("sync");
+        assert!(writes.lock().expect("lock").is_empty(), "a matching ruleset was rewritten");
+    }
+
+    #[tokio::test]
+    async fn a_merge_queue_the_config_drops_or_changes_is_rewritten_and_the_checks_kept() {
+        let mut server = mockito::Server::new_async().await;
+        let mut ruleset = require_a_with(5, Some(json!([])));
+        ruleset["rules"].as_array_mut().expect("rules").push(json!({"type": "merge_queue", "parameters": merge_queue_parameters(&squash_queue())}));
+        let _mocks = mock_org_with_teams(&mut server, &[], &[("r", json!({}))], |_| json!([]), |_| Some(vec![ruleset.clone()])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _put = record(&mut server, &writes, "PUT", "/repos/o/r/rulesets/5").await;
+        for (config, queue_rules) in [
+            ("org: o\nrepos:\n- name: r\n  required_checks: [A]\n", 0),
+            ("org: o\nrepos:\n- name: r\n  required_checks: [A]\n  merge_queue: {merge_method: merge}\n", 1),
+        ] {
+            writes.lock().expect("lock").clear();
+            let file = write_file(config);
+            let path = file.path().to_str().expect("utf-8 path");
+            assert!(client(&server).diff(path).await.expect("diff"), "a different queue was called a match: {config}");
+            client(&server).sync(path, false).await.expect("sync");
+            let writes = writes.lock().expect("lock");
+            let [put] = writes.as_slice() else { panic!("{writes:?}") };
+            let sent: serde_json::Value = serde_json::from_str(put.trim_start_matches("PUT /repos/o/r/rulesets/5 ")).expect("json body");
+            let rules = sent["rules"].as_array().expect("rules");
+            assert_eq!(rules[0], ruleset["rules"][0], "the checks changed");
+            assert_eq!(rules.len(), 1 + queue_rules, "{sent}");
+            if queue_rules == 1 {
+                assert_eq!(rules[1]["parameters"]["merge_method"], "MERGE");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dry_run_names_the_merge_queue_change() {
+        let queue = squash_queue();
+        assert_eq!(queue_change(Some(&queue), Some(&queue)), "");
+        assert_eq!(
+            queue_change(Some(&queue), None),
+            "; merge queue: squash merge, allgreen groups of 1-5 (waiting 5 min), 5 built at once, checks time out after 60 min"
+        );
+        assert_eq!(queue_change(None, Some(&queue)), "; merge queue removed");
+    }
+
+    #[test]
+    fn a_merge_queue_a_config_cant_name_is_refused() {
+        let mut ruleset = require_a_with(5, Some(json!([])));
+        let mut params = merge_queue_parameters(&squash_queue());
+        params["merge_method"] = json!("FAST_FORWARD");
+        ruleset["rules"].as_array_mut().expect("rules").push(json!({"type": "merge_queue", "parameters": params}));
+        let err = parse_require_ci("r", &ruleset).err().expect("accepted").to_string();
+        assert!(err.contains("merge_method") && err.contains("FAST_FORWARD"), "{err}");
     }
 
     #[tokio::test]

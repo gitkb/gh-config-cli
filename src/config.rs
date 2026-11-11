@@ -92,6 +92,80 @@ pub struct Repo {
     /// bypass list exactly this, so leaving it out removes every bypass. Needs `required_checks`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_checks_bypass: Vec<CheckBypass>,
+    /// A merge queue on the default branch, kept in the `Require CI` ruleset: a PR merges only through the
+    /// queue, whose groups must pass `required_checks`. Needs `required_checks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue: Option<MergeQueue>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+/// GitHub's merge queue rule. Only `merge_method` must be given; the rest default to GitHub's own defaults
+/// for a new queue.
+pub struct MergeQueue {
+    pub merge_method: MergeMethod,
+    /// `allgreen`: every PR in a group must pass; `headgreen`: only the group's head.
+    #[serde(default)]
+    pub grouping: MergeGrouping,
+    /// How many queued PRs are built at once.
+    #[serde(default = "five")]
+    pub max_entries_to_build: u32,
+    /// The smallest group merged once `min_entries_to_merge_wait_minutes` have passed.
+    #[serde(default = "one")]
+    pub min_entries_to_merge: u32,
+    /// The largest group merged at once.
+    #[serde(default = "five")]
+    pub max_entries_to_merge: u32,
+    #[serde(default = "five")]
+    pub min_entries_to_merge_wait_minutes: u32,
+    /// How long a group waits for its required checks before it fails.
+    #[serde(default = "sixty")]
+    pub check_response_timeout_minutes: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+fn five() -> u32 {
+    5
+}
+fn sixty() -> u32 {
+    60
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeGrouping {
+    #[default]
+    Allgreen,
+    Headgreen,
+}
+
+impl MergeQueue {
+    /// What's wrong with the numbers, if anything. GitHub's limits: 0-100 entries, waits 0-360 minutes,
+    /// a check timeout of 1-360 minutes.
+    pub fn problem(&self) -> Option<String> {
+        let entries = [self.max_entries_to_build, self.min_entries_to_merge, self.max_entries_to_merge];
+        if entries.iter().any(|n| *n > 100) {
+            Some("entry counts must be 0-100".into())
+        } else if self.min_entries_to_merge > self.max_entries_to_merge {
+            Some("min_entries_to_merge is above max_entries_to_merge".into())
+        } else if self.min_entries_to_merge_wait_minutes > 360 {
+            Some("min_entries_to_merge_wait_minutes must be 0-360".into())
+        } else if !(1..=360).contains(&self.check_response_timeout_minutes) {
+            Some("check_response_timeout_minutes must be 1-360".into())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -241,6 +315,14 @@ impl Config {
                 let unknown = bypass.iter().find(|b| !config.teams.is_empty() && !config.teams.iter().any(|t| t.name == b.team));
                 unknown.map(|b| format!("team `{}` isn't one of the config's `teams`.", b.team))
             };
+            let queue_problem = match &repo.merge_queue {
+                Some(_) if checks.is_empty() => Some("a merge queue needs `required_checks`: its groups must pass them, and without them `sync` leaves the repo's rulesets alone.".to_string()),
+                Some(queue) => queue.problem(),
+                None => None,
+            };
+            if let Some(problem) = queue_problem {
+                return Err(crate::error::AppError::Config(format!("{main_path}: repos[{i}].merge_queue (repo {}): {problem}", repo.name)));
+            }
             if let Some(problem) = bypass_problem {
                 return Err(crate::error::AppError::Config(format!(
                     "{main_path}: repos[{i}].required_checks_bypass (repo {}): {problem}",
@@ -427,6 +509,35 @@ allow_force_pushes: false
         std::io::Write::write_all(&mut file, b"org: o\nrepos:\n- name: r\n  required_checks: [A, B, A]\n").unwrap();
         let err = Config::from_file_with_defaults(file.path().to_str().unwrap(), None).unwrap_err().to_string();
         assert!(err.contains("required_checks") && err.contains("`A` is listed twice"), "{err}");
+    }
+
+    #[test]
+    fn a_merge_queue_needs_checks_a_known_method_and_sane_numbers() {
+        let load = |text: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+            Config::from_file_with_defaults(file.path().to_str().unwrap(), None).map_err(|e| e.to_string())
+        };
+        let ok = load("org: o\nrepos:\n- name: r\n  required_checks: [CI gate]\n  merge_queue: {merge_method: squash}\n").unwrap();
+        let queue = ok.repos[0].merge_queue.clone().unwrap();
+        assert_eq!((queue.merge_method, queue.grouping), (MergeMethod::Squash, MergeGrouping::Allgreen));
+        assert_eq!(
+            (queue.max_entries_to_build, queue.min_entries_to_merge, queue.max_entries_to_merge, queue.min_entries_to_merge_wait_minutes, queue.check_response_timeout_minutes),
+            (5, 1, 5, 5, 60),
+            "GitHub's defaults for a new queue"
+        );
+        for (queue, expected) in [
+            ("{merge_method: fast_forward}", "unknown variant `fast_forward`"),
+            ("{grouping: allgreen}", "missing field `merge_method`"),
+            ("{merge_method: squash, max_entries: 3}", "unknown field `max_entries`"),
+            ("{merge_method: squash, min_entries_to_merge: 6}", "min_entries_to_merge is above max_entries_to_merge"),
+            ("{merge_method: squash, check_response_timeout_minutes: 0}", "check_response_timeout_minutes must be 1-360"),
+        ] {
+            let err = load(&format!("org: o\nrepos:\n- name: r\n  required_checks: [CI gate]\n  merge_queue: {queue}\n")).unwrap_err();
+            assert!(err.contains("merge_queue") && err.contains(expected), "{queue}: {err}");
+        }
+        let err = load("org: o\nrepos:\n- name: r\n  merge_queue: {merge_method: squash}\n").unwrap_err();
+        assert!(err.contains("needs `required_checks`"), "{err}");
     }
 
     #[test]

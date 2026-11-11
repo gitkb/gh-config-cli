@@ -56,6 +56,8 @@ repos:                            # (list) Repository configurations
     required_checks_bypass:       # (list, optional) The only teams that may merge past required_checks
       - team: core-team           # (string) Team slug
         mode: pull_request        # (string) pull_request (by merging a PR) or always (also direct pushes)
+    merge_queue:                  # (object, optional) PRs merge through a queue; needs required_checks
+      merge_method: squash        # (string) merge, squash or rebase; the other fields default to GitHub's
     webhook:                      # (object, optional) This repo's own webhook
       url: "http://example.com"   # (string) Webhook endpoint URL
       content_type: "json"        # (string) Payload content type

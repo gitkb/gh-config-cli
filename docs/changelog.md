@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 - `sync` creates repos the config lists and GitHub doesn't have, with their `visibility`.
 - `sync-from-org` and `diff` record `allow_auto_merge` and private repos' Actions `access_level`, so the drift check keeps them; `sync` reads `access_level` before writing it.
 - New repo field `required_checks`, kept in the repo ruleset `Require CI`.
+- New repo field `merge_queue`: a merge queue rule in `Require CI`, whose groups must pass `required_checks`. `sync` writes it, `sync-from-org` and `diff` read it back.
 - New repo field `required_checks_bypass`: the teams, and only those, that may bypass `Require CI` (`pull_request` or `always`). `sync` writes it, `sync-from-org` and `diff` read it back.
 
 ## [v1.3.2] - 2026-11-09
