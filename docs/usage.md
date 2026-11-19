@@ -41,6 +41,10 @@ The configuration file is written in YAML and describes your organization, repos
 ```yaml
 org: gitkb                # (string) Name of the GitHub organization
 
+actions:                          # (object, optional) Org Actions workflow settings; absent: left alone
+  default_workflow_permissions: read        # (string) read or write: a workflow's default GITHUB_TOKEN permissions
+  can_approve_pull_request_reviews: false   # (bool) Whether Actions may create and approve PRs
+
 repos:                            # (list) Repository configurations
   - name: my-repo                 # (string) Repository name
     settings:                     # (map) GitHub repo settings from the API mapping (see below)
@@ -52,7 +56,8 @@ repos:                            # (list) Repository configurations
       access_level: organization  # (string, private repos only) Who may call this repo's workflows: none, user, organization
     visibility: private           # (string, optional) "public" or "private"; required for sync to create a missing repo
     required_checks:              # (list, optional) Checks a PR to the default branch must pass (ruleset `Require CI`)
-      - Unit Tests
+      - Unit Tests                # A name: any app may post it
+      - {context: "gate / CI gate", app_id: 15368}  # Pinned: only this GitHub App (15368 is GitHub Actions)
     required_checks_bypass:       # (list, optional) The only teams that may merge past required_checks
       - team: core-team           # (string) Team slug
         mode: pull_request        # (string) pull_request (by merging a PR) or always (also direct pushes)

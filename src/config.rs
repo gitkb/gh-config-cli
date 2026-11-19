@@ -3,7 +3,7 @@
 //! This module defines the data structures used for representing repository, team, user, and webhook
 //! configuration. All structs are serializable/deserializable for use with YAML and JSON configuration files.
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use serde_yaml::Value;
 use std::collections::BTreeMap;
@@ -84,14 +84,68 @@ pub struct Repo {
     pub webhook: Option<WebhookConfig>,
     #[serde(default)]
     pub branch_protections: Vec<BranchProtectionRule>,
-    /// Status checks that must pass before a PR merges to the default branch, held in the repo's
-    /// `Require CI` ruleset. Empty: `sync` leaves the repo's rulesets alone.
+    /// Status checks that must pass before a PR merges to the default branch, each pinned to the app that must
+    /// post it or to none, held in the repo's `Require CI` ruleset. Empty: `sync` leaves the repo's rulesets alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_checks: Vec<String>,
+    pub required_checks: Vec<RequiredCheck>,
     /// The teams that may merge past `required_checks`, and how. Nobody else can: `sync` makes the ruleset's
     /// bypass list exactly this, so leaving it out removes every bypass. Needs `required_checks`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_checks_bypass: Vec<CheckBypass>,
+}
+
+/// A required status check: its name, and the GitHub App that must post it, if pinned (GitHub's `integration_id`).
+/// Written as the name alone (any app may post it) or as `{context: <name>, app_id: <id>}`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RequiredCheck {
+    pub context: String,
+    pub app_id: Option<u64>,
+}
+
+/// The pinned form of a `RequiredCheck`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinnedCheck {
+    context: String,
+    app_id: u64,
+}
+
+impl Serialize for RequiredCheck {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.app_id {
+            None => serializer.serialize_str(&self.context),
+            Some(app_id) => PinnedCheck { context: self.context.clone(), app_id }.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RequiredCheck {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Check;
+        impl<'de> de::Visitor<'de> for Check {
+            type Value = RequiredCheck;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a check name, or `{context: <name>, app_id: <id>}`")
+            }
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<RequiredCheck, E> {
+                Ok(RequiredCheck { context: name.to_string(), app_id: None })
+            }
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<RequiredCheck, A::Error> {
+                let pinned = PinnedCheck::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(RequiredCheck { context: pinned.context, app_id: Some(pinned.app_id) })
+            }
+        }
+        deserializer.deserialize_any(Check)
+    }
+}
+
+impl std::fmt::Display for RequiredCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.app_id {
+            None => f.write_str(&self.context),
+            Some(app_id) => write!(f, "{} (app {app_id})", self.context),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -118,6 +172,35 @@ impl BypassMode {
         match self {
             BypassMode::PullRequest => "pull_request",
             BypassMode::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+/// The org's Actions workflow settings (GitHub's `/orgs/{org}/actions/permissions/workflow`).
+pub struct OrgActions {
+    /// What the `GITHUB_TOKEN` of a workflow run may do by default.
+    pub default_workflow_permissions: WorkflowPermissions,
+    /// Whether Actions may create and approve pull requests.
+    pub can_approve_pull_request_reviews: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// GitHub's `default_workflow_permissions`.
+pub enum WorkflowPermissions {
+    /// Read the repo's contents and packages.
+    Read,
+    /// Read and write every permission.
+    Write,
+}
+
+impl WorkflowPermissions {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkflowPermissions::Read => "read",
+            WorkflowPermissions::Write => "write",
         }
     }
 }
@@ -177,6 +260,9 @@ pub struct Assignment {
 pub struct Config {
     /// The name of the GitHub organization.
     pub org: String,
+    /// The org's Actions workflow settings. Absent: `sync` leaves them alone.
+    #[serde(default)]
+    pub actions: Option<OrgActions>,
     /// List of repository configurations.
     #[serde(default)]
     pub repos: Vec<Repo>,
@@ -226,7 +312,7 @@ impl Config {
         let all = crate::github_api_mapping_generated::get_github_api_mapping();
         for (i, repo) in config.repos.iter().enumerate() {
             let checks = &repo.required_checks;
-            if let Some(dup) = checks.iter().enumerate().find_map(|(j, c)| checks.iter().take(j).any(|x| x == c).then_some(c)) {
+            if let Some(dup) = checks.iter().enumerate().find_map(|(j, c)| checks.iter().take(j).any(|x| x.context == c.context).then_some(&c.context)) {
                 return Err(crate::error::AppError::Config(format!(
                     "{main_path}: repos[{i}].required_checks (repo {}): `{dup}` is listed twice.",
                     repo.name
@@ -427,6 +513,48 @@ allow_force_pushes: false
         std::io::Write::write_all(&mut file, b"org: o\nrepos:\n- name: r\n  required_checks: [A, B, A]\n").unwrap();
         let err = Config::from_file_with_defaults(file.path().to_str().unwrap(), None).unwrap_err().to_string();
         assert!(err.contains("required_checks") && err.contains("`A` is listed twice"), "{err}");
+    }
+
+    #[test]
+    fn a_check_is_a_name_or_a_name_pinned_to_an_app() {
+        let load = |checks: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut file, format!("org: o\nrepos:\n- name: r\n  required_checks: {checks}\n").as_bytes()).unwrap();
+            Config::from_file_with_defaults(file.path().to_str().unwrap(), None).map_err(|e| e.to_string())
+        };
+        let ok = load(r#"[A, {context: "gate / CI gate", app_id: 15368}]"#).unwrap();
+        assert_eq!(
+            ok.repos[0].required_checks,
+            [RequiredCheck { context: "A".into(), app_id: None }, RequiredCheck { context: "gate / CI gate".into(), app_id: Some(15368) }]
+        );
+        for (checks, expected) in [
+            ("[{context: A, appid: 1}]", "unknown field `appid`"),
+            ("[{context: A}]", "missing field `app_id`"),
+            ("[{context: A, app_id: actions}]", "required_checks[0].app_id"),
+            ("[A, {context: A, app_id: 1}]", "`A` is listed twice"),
+        ] {
+            let err = load(checks).unwrap_err();
+            assert!(err.contains("required_checks") && err.contains(expected), "{checks}: {err}");
+        }
+    }
+
+    #[test]
+    fn org_actions_take_both_settings_and_nothing_else() {
+        let load = |actions: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut file, format!("org: o\nactions: {actions}\n").as_bytes()).unwrap();
+            Config::from_file_with_defaults(file.path().to_str().unwrap(), None).map_err(|e| e.to_string())
+        };
+        let ok = load("{default_workflow_permissions: read, can_approve_pull_request_reviews: false}").unwrap();
+        assert_eq!(ok.actions, Some(OrgActions { default_workflow_permissions: WorkflowPermissions::Read, can_approve_pull_request_reviews: false }));
+        for (actions, expected) in [
+            ("{default_workflow_permissions: admin, can_approve_pull_request_reviews: false}", "unknown variant `admin`"),
+            ("{default_workflow_permissions: read, can_approve_pull_request_reviews: false, can_approve: true}", "unknown field `can_approve`"),
+            ("{default_workflow_permissions: read}", "missing field `can_approve_pull_request_reviews`"),
+        ] {
+            let err = load(actions).unwrap_err();
+            assert!(err.contains("actions") && err.contains(expected), "{actions}: {err}");
+        }
     }
 
     #[test]
