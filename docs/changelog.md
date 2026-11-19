@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 - `sync-from-org` and `diff` record `allow_auto_merge` and private repos' Actions `access_level`, so the drift check keeps them; `sync` reads `access_level` before writing it.
 - New repo field `required_checks`, kept in the repo ruleset `Require CI`.
 - New repo field `required_checks_bypass`: the teams, and only those, that may bypass `Require CI` (`pull_request` or `always`). `sync` writes it, `sync-from-org` and `diff` read it back.
+- A required check can be pinned to the app that must post it: `{context: <name>, app_id: <id>}`. Only an `app_id` sets or changes a pin; a plain name keeps the ruleset's. `sync`, `diff` and `sync-from-org` compare and record pins.
+- `sync` keeps a `Require CI` ruleset's branch conditions and strictness when it rewrites it, instead of resetting them to the default branch and not strict.
+- New top-level `actions` block: the org's `default_workflow_permissions` and `can_approve_pull_request_reviews`. `sync` writes them, `sync-from-org` and `diff` read them back; without the block they're left alone.
 
 ## [v1.3.2] - 2026-11-09
 

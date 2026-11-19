@@ -9,7 +9,7 @@
     Public APIs are documented for maintainability. Internal response structs are used for deserialization.
 */
 
-use crate::config::{Assignment, BypassMode, CheckBypass, Repo, RepoSettings, Team, User, WebhookConfig, Config};
+use crate::config::{Assignment, BypassMode, CheckBypass, Config, OrgActions, Repo, RepoSettings, RequiredCheck, Team, User, WebhookConfig};
 use crate::error::{AppError, AppResult};
 use colored::*;
 use log::{debug, info, error};
@@ -41,13 +41,6 @@ fn omitted_defaults() -> [(&'static str, serde_yaml::Value); 3] {
         (ALLOW_AUTO_MERGE, serde_yaml::Value::Bool(false)),
         (ACCESS_LEVEL, serde_yaml::Value::String("none".into())),
     ]
-}
-
-/// One required status check. `integration_id`, when GitHub has one, pins the check to the app that must post it.
-#[derive(Debug, Clone, PartialEq)]
-struct RequiredCheck {
-    context: String,
-    integration_id: Option<u64>,
 }
 
 /// One entry of a ruleset's bypass list, as GitHub holds it: a team, an app, a role, the org's admins...
@@ -123,18 +116,19 @@ struct RequireCi {
     checks: Vec<RequiredCheck>,
     /// Sorted. `None` when GitHub didn't say: it shows a ruleset's bypass list only to tokens that can administer the repo.
     bypass: Option<Vec<BypassActor>>,
-    /// Whether everything but the checks is what `sync` writes: active, on the default branch, not strict.
+    /// The branches it covers (`conditions`) and whether a PR must be up to date first. `sync` keeps both.
+    conditions: serde_json::Value,
+    strict: bool,
+    /// Whether everything else is what `sync` writes: active, enforced on branch creation too.
     standard: bool,
 }
 
-impl RequireCi {
-    fn contexts(&self) -> Vec<String> {
-        self.checks.iter().map(|c| c.context.clone()).collect()
-    }
-}
-
-/// The `Require CI` ruleset `sync` writes for `checks`, which only `bypass` may merge past.
-fn require_ci_body(checks: &[RequiredCheck], bypass: &[BypassActor]) -> serde_json::Value {
+/// The `Require CI` ruleset `sync` writes for `checks`, which only `bypass` may merge past. A new one covers the
+/// default branch and isn't strict; rewriting `held` keeps its branches and strictness, so it never covers less.
+fn require_ci_body(checks: &[RequiredCheck], bypass: &[BypassActor], held: Option<&RequireCi>) -> serde_json::Value {
+    let default_conditions = json!({ "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } });
+    let conditions = held.map_or(&default_conditions, |h| &h.conditions);
+    let strict = held.is_some_and(|h| h.strict);
     let bypass: Vec<_> = bypass
         .iter()
         .map(|a| match a.actor_id {
@@ -144,7 +138,7 @@ fn require_ci_body(checks: &[RequiredCheck], bypass: &[BypassActor]) -> serde_js
         .collect();
     let checks: Vec<_> = checks
         .iter()
-        .map(|c| match c.integration_id {
+        .map(|c| match c.app_id {
             Some(id) => json!({ "context": c.context, "integration_id": id }),
             None => json!({ "context": c.context }),
         })
@@ -154,12 +148,12 @@ fn require_ci_body(checks: &[RequiredCheck], bypass: &[BypassActor]) -> serde_js
         "target": "branch",
         "enforcement": "active",
         "bypass_actors": bypass,
-        "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+        "conditions": conditions,
         "rules": [{
             "type": REQUIRED_STATUS_CHECKS,
             "parameters": {
                 "required_status_checks": checks,
-                "strict_required_status_checks_policy": false,
+                "strict_required_status_checks_policy": strict,
                 "do_not_enforce_on_create": false,
             },
         }],
@@ -183,7 +177,7 @@ fn parse_require_ci(repo: &str, ruleset: &serde_json::Value) -> AppResult<Requir
                 .iter()
                 .filter_map(|c| {
                     let context = c["context"].as_str()?.to_string();
-                    Some(RequiredCheck { context, integration_id: c["integration_id"].as_u64() })
+                    Some(RequiredCheck { context, app_id: c["integration_id"].as_u64() })
                 })
                 .collect()
         })
@@ -194,13 +188,15 @@ fn parse_require_ci(repo: &str, ruleset: &serde_json::Value) -> AppResult<Requir
             "Repo {repo}: its `{REQUIRE_CI}` ruleset requires `{dup}` twice (from different apps). A config names a check once, so gh-config would drop one: change the ruleset first."
         )));
     }
-    let ref_name = &ruleset["conditions"]["ref_name"];
-    let standard = rules.len() == 1
-        && ruleset["target"] == "branch"
-        && ruleset["enforcement"] == "active"
-        && ref_name["include"] == json!(["~DEFAULT_BRANCH"])
-        && ref_name["exclude"].as_array().is_some_and(Vec::is_empty)
-        && params.is_some_and(|p| p["strict_required_status_checks_policy"] == false && p["do_not_enforce_on_create"] == false);
+    if ruleset["target"] != "branch" || !ruleset["conditions"].is_object() {
+        return Err(AppError::GitHubApi(format!(
+            "Repo {repo}: its `{REQUIRE_CI}` ruleset targets `{}` with conditions {}, which gh-config can't keep: change the ruleset first.",
+            ruleset["target"], ruleset["conditions"]
+        )));
+    }
+    let conditions = ruleset["conditions"].clone();
+    let strict = params.is_some_and(|p| p["strict_required_status_checks_policy"] == true);
+    let standard = rules.len() == 1 && ruleset["enforcement"] == "active" && params.is_some_and(|p| p["do_not_enforce_on_create"] == false);
     let bypass = ruleset["bypass_actors"].as_array().map(|actors| {
         let mut actors: Vec<_> = actors
             .iter()
@@ -213,11 +209,11 @@ fn parse_require_ci(repo: &str, ruleset: &serde_json::Value) -> AppResult<Requir
         actors.sort();
         actors
     });
-    Ok(RequireCi { id, checks, bypass, standard })
+    Ok(RequireCi { id, checks, bypass, conditions, strict, standard })
 }
 
-/// Whether two check lists hold the same names, in any order.
-fn same_checks(a: &[String], b: &[String]) -> bool {
+/// Whether two check lists hold the same checks, each pinned to the same app, in any order.
+fn same_checks(a: &[RequiredCheck], b: &[RequiredCheck]) -> bool {
     let mut a = a.to_vec();
     let mut b = b.to_vec();
     a.sort();
@@ -521,6 +517,38 @@ impl GitHubClient {
             .collect()
     }
 
+    /// The org's Actions workflow settings.
+    async fn read_org_actions(&self) -> AppResult<OrgActions> {
+        let url = format!("{}/orgs/{}/actions/permissions/workflow", self.api_url, self.org);
+        let held: serde_json::Value = serde_json::from_str(&self.get(&url).await?.text().await?)
+            .map_err(|e| AppError::GitHubApi(format!("Failed to parse response from {}: {}", url, e)))?;
+        // Only the fields a config holds: GitHub may add others.
+        let fields = json!({
+            "default_workflow_permissions": held["default_workflow_permissions"],
+            "can_approve_pull_request_reviews": held["can_approve_pull_request_reviews"],
+        });
+        serde_json::from_value(fields).map_err(|e| AppError::GitHubApi(format!("Unexpected response from {}: {}", url, e)))
+    }
+
+    /// Makes the org's Actions workflow settings `actions`, writing only when they differ.
+    async fn sync_org_actions(&self, actions: &OrgActions, dry_run: bool) -> AppResult<()> {
+        let held = self.read_org_actions().await?;
+        if held == *actions {
+            return Ok(());
+        }
+        let describe = |a: &OrgActions| {
+            format!("default_workflow_permissions: {}, can_approve_pull_request_reviews: {}", a.default_workflow_permissions.as_str(), a.can_approve_pull_request_reviews)
+        };
+        if dry_run {
+            println!("[Dry Run] Would set the Actions workflow settings of {} to {} (now {})", self.org, describe(actions), describe(&held));
+            return Ok(());
+        }
+        let url = format!("{}/orgs/{}/actions/permissions/workflow", self.api_url, self.org);
+        self.send_put(&url, Some(serde_json::to_value(actions)?)).await?;
+        info!("Actions workflow settings of {} now: {}", self.org, describe(actions));
+        Ok(())
+    }
+
     /// Makes the repo's `Require CI` ruleset require exactly `repo.required_checks`, with exactly
     /// `repo.required_checks_bypass` allowed past them. A repo with no checks is left alone.
     async fn sync_required_checks(&self, repo: &Repo, teams: &TeamIds, dry_run: bool) -> AppResult<()> {
@@ -531,27 +559,32 @@ impl GitHubClient {
         let bypass = bypass_actors(&self.org, repo, teams)?;
         let current = self.read_require_ci(&repo.name).await?;
         let held = current.as_ref().map(|c| c.checks.clone()).unwrap_or_default();
-        // A check kept from the ruleset keeps the app it's pinned to; a new one has none.
+        // Only a config's `app_id` sets or changes a pin: a plain name keeps the one the ruleset has.
         let desired: Vec<RequiredCheck> = checks
             .iter()
-            .map(|name| held.iter().find(|c| &c.context == name).cloned().unwrap_or(RequiredCheck { context: name.clone(), integration_id: None }))
+            .map(|c| match c.app_id {
+                Some(_) => c.clone(),
+                None => held.iter().find(|h| h.context == c.context).cloned().unwrap_or_else(|| c.clone()),
+            })
             .collect();
         let held_bypass = current.as_ref().and_then(|c| c.bypass.clone());
-        let (method, url) = match current {
-            Some(current) if current.standard && same_checks(&current.contexts(), checks) && current.bypass.as_ref() == Some(&bypass) => return Ok(()),
+        let (method, url) = match &current {
+            Some(current) if current.standard && same_checks(&current.checks, &desired) && current.bypass.as_ref() == Some(&bypass) => return Ok(()),
             Some(current) => (Method::PUT, format!("{}/repos/{}/{}/rulesets/{}", self.api_url, self.org, repo.name, current.id)),
             None => (Method::POST, format!("{}/repos/{}/{}/rulesets", self.api_url, self.org, repo.name)),
         };
         let verb = if method == Method::POST { "create" } else { "update" };
+        let named = |checks: &[&RequiredCheck]| checks.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ");
+        let requiring = named(&desired.iter().collect::<Vec<_>>());
         if dry_run {
-            let removed: Vec<_> = held.iter().map(|c| c.context.as_str()).filter(|c| !checks.iter().any(|n| n == c)).collect();
-            let removed = if removed.is_empty() { String::new() } else { format!("; no longer requiring: {}", removed.join(", ")) };
+            let removed: Vec<_> = held.iter().filter(|c| !desired.contains(c)).collect();
+            let removed = if removed.is_empty() { String::new() } else { format!("; no longer requiring: {}", named(&removed)) };
             let bypass = bypass_change(&bypass, held_bypass.as_deref(), method == Method::PUT, teams);
-            println!("[Dry Run] Would {verb} ruleset `{REQUIRE_CI}` on {}/{} requiring: {}{removed}; {bypass}", self.org, repo.name, checks.join(", "));
+            println!("[Dry Run] Would {verb} ruleset `{REQUIRE_CI}` on {}/{} requiring: {requiring}{removed}; {bypass}", self.org, repo.name);
             return Ok(());
         }
-        self.client.request(method, &url, "application/vnd.github+json", Some(require_ci_body(&desired, &bypass))).await?;
-        info!("Ruleset `{REQUIRE_CI}` on {}/{} now requires: {}; bypass: {}", self.org, repo.name, checks.join(", "), bypass.len());
+        self.client.request(method, &url, "application/vnd.github+json", Some(require_ci_body(&desired, &bypass, current.as_ref()))).await?;
+        info!("Ruleset `{REQUIRE_CI}` on {}/{} now requires: {requiring}; bypass: {}", self.org, repo.name, bypass.len());
         Ok(())
     }
 
@@ -1005,9 +1038,12 @@ impl GitHubClient {
             Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        let (config, unread) = self.generate_unfiltered_config_from_org(file.as_ref()).await?;  // Make sure to call an unfiltered version
+        let (config, unread, unrecorded) = self.generate_unfiltered_config_from_org(file.as_ref()).await?;  // Make sure to call an unfiltered version
         if !unread.is_empty() {
             println!("Not read, so these keep what the file has for them: {}", unread.join(", "));
+        }
+        if !unrecorded.is_empty() {
+            println!("Not read, so the config doesn't record them: {}", unrecorded.join(", "));
         }
 
         // ... rest of the YAML writing logic ...
@@ -1015,6 +1051,11 @@ impl GitHubClient {
 
          let mut yaml_content = String::new();
          yaml_content.push_str(&format!("org: {}\n\n", config.org));
+         if let Some(actions) = &config.actions {
+             yaml_content.push_str("actions:\n");
+             yaml_content.push_str(&format!("  default_workflow_permissions: {}\n", actions.default_workflow_permissions.as_str()));
+             yaml_content.push_str(&format!("  can_approve_pull_request_reviews: {}\n\n", actions.can_approve_pull_request_reviews));
+         }
 
          // Add assignments (sorted)
          let mut assignments = config.assignments;
@@ -1092,7 +1133,11 @@ impl GitHubClient {
                 if !repo.required_checks.is_empty() {
                     yaml_content.push_str("  required_checks:\n");
                     for check in &repo.required_checks {
-                        yaml_content.push_str(&format!("  - {}\n", serde_yaml::to_string(check)?.trim()));
+                        let context = serde_yaml::to_string(&check.context)?;
+                        match check.app_id {
+                            None => yaml_content.push_str(&format!("  - {}\n", context.trim())),
+                            Some(app_id) => yaml_content.push_str(&format!("  - context: {}\n    app_id: {app_id}\n", context.trim())),
+                        }
                     }
                 }
                 if !repo.required_checks_bypass.is_empty() {
@@ -1148,21 +1193,43 @@ impl GitHubClient {
              println!("Writing generated config to {}", config_path);
              let mut file = File::create(config_path).map_err(AppError::Io)?;
              file.write_all(yaml_content.as_bytes()).map_err(AppError::Io)?;
-             println!("Config generation completed successfully.");
+             if unrecorded.is_empty() {
+                 println!("Config generation completed successfully.");
+             } else {
+                 println!("Config generation completed without: {}", unrecorded.join(", "));
+             }
          }
         Ok(())
     }
 
     /// The org as a config, reading `file` for what GitHub can't say: which default to keep and, as a config holds
     /// one webhook per repo, which of a repo's webhooks to record. Without a default, the first webhook found is it.
-    /// Also returns the repos whose webhooks couldn't be read: their webhook is the file's, not GitHub's.
-    async fn generate_unfiltered_config_from_org(&self, file: Option<&Config>) -> AppResult<(Config, Vec<String>)> {
+    /// Also returns what couldn't be read and so is the file's, not GitHub's (a repo's webhook, ...), and what
+    /// couldn't be read and isn't in the file, so the config doesn't record it.
+    async fn generate_unfiltered_config_from_org(&self, file: Option<&Config>) -> AppResult<(Config, Vec<String>, Vec<String>)> {
         let mut default_webhook = file
             .and_then(|file| file.default_webhook.clone())
             .map(|wh| WebhookConfig { events: sorted(&wh.events), ..wh });
         // This is essentially the original logic of generate_config_from_org
          let mut repos = Vec::new();
         let mut unread = Vec::new();
+        let mut unrecorded = Vec::new();
+        let actions = match self.read_org_actions().await {
+            Ok(actions) => Some(actions),
+            Err(e) => {
+                // Only a file that manages them loses anything: the others leave them alone.
+                let kept = file.and_then(|file| file.actions.clone());
+                if kept.is_some() {
+                    error!("Failed to read the Actions workflow settings of {}: {}. They stay as the file has them.", self.org, e);
+                    unread.push(format!("{} (Actions workflow settings)", self.org));
+                } else {
+                    // Shown at the default log level, and named again when the file is written.
+                    error!("Failed to read the Actions workflow settings of {}: {}. The config won't record them.", self.org, e);
+                    unrecorded.push(format!("{} (Actions workflow settings)", self.org));
+                }
+                kept
+            }
+        };
         let team_ids = self.team_ids().await?;
         let repo_url = format!("{}/orgs/{}/repos?per_page=100", self.api_url, self.org);
         let repo_json: Vec<serde_json::Value> = self.get_all(&repo_url).await?;
@@ -1239,7 +1306,7 @@ impl GitHubClient {
             let (required_checks, required_checks_bypass) = match self.read_require_ci(&name).await {
                 Ok(found) => {
                     // The file's order when it names the same checks, so regenerating doesn't reorder them.
-                    let checks = match found.as_ref().map(RequireCi::contexts).unwrap_or_default() {
+                    let checks = match found.as_ref().map(|r| r.checks.clone()).unwrap_or_default() {
                         checks if same_checks(&checks, &file_checks) => file_checks,
                         checks => checks,
                     };
@@ -1323,6 +1390,7 @@ impl GitHubClient {
 
         let config = Config {
             org: self.org.clone(),
+            actions,
             repos,
             teams,
             users,
@@ -1330,7 +1398,7 @@ impl GitHubClient {
             default_webhook,
             default_branch_protections: vec![], // Add logic if needed
         };
-        Ok((config, unread))
+        Ok((config, unread, unrecorded))
     }
 
     pub async fn sync(&mut self, config_path: &str, dry_run: bool) -> AppResult<()> {
@@ -1359,6 +1427,9 @@ impl GitHubClient {
         teams.extend(adds.iter().cloned());
         for repo in &config.repos {
             bypass_actors(&self.org, repo, &teams)?;
+        }
+        if let Some(actions) = &config.actions {
+            self.sync_org_actions(actions, dry_run).await?;
         }
         for team in &config.teams {
             info!("Processing team: {}", team.name);
@@ -1458,7 +1529,8 @@ impl GitHubClient {
         check_archived(&local_config)?;
 
         // --- Step 2: Fetch FULL GitHub org state (unfiltered, as sync-from-github would write) ---
-        let (github_config, unread) = self.generate_unfiltered_config_from_org(Some(&local_config)).await?;
+        // What isn't in the file and couldn't be read isn't compared: the file doesn't manage it.
+        let (github_config, unread, _) = self.generate_unfiltered_config_from_org(Some(&local_config)).await?;
 
         // --- Step 3: Prepare final versions for diffing ---
         let mut diff_local_config = local_config.clone(); // Clone original local config
@@ -1473,6 +1545,10 @@ impl GitHubClient {
                     remote.settings.entry(key.to_string()).or_insert(default);
                 }
             }
+        }
+        // A config without `actions` leaves them alone, so there is nothing to compare.
+        if diff_local_config.actions.is_none() {
+            diff_github_config.actions = None;
         }
         // Required checks and their bypass list are sets: their order means nothing.
         for repo in diff_local_config.repos.iter_mut().chain(diff_github_config.repos.iter_mut()) {
@@ -1679,6 +1755,12 @@ mod tests {
         let team_list: Vec<_> = teams.iter().map(|(slug, id)| json!({"slug": slug, "name": slug, "id": id})).collect();
         let mut mocks = vec![
             server.mock("GET", "/orgs/o/teams?per_page=100").with_body(json!(team_list).to_string()).create_async().await,
+            // GitHub's defaults for a new org, plus a field a config doesn't hold. Second: a test removes it by index.
+            server
+                .mock("GET", "/orgs/o/actions/permissions/workflow")
+                .with_body(r#"{"default_workflow_permissions": "write", "can_approve_pull_request_reviews": true, "other": 1}"#)
+                .create_async()
+                .await,
             server.mock("GET", "/orgs/o/members?per_page=100").with_body("[]").create_async().await,
         ];
         for (slug, _) in teams {
@@ -1728,12 +1810,12 @@ mod tests {
 
     /// `checks` pinned to no app.
     fn unpinned(checks: &[&str]) -> Vec<RequiredCheck> {
-        checks.iter().map(|c| RequiredCheck { context: c.to_string(), integration_id: None }).collect()
+        checks.iter().map(|c| RequiredCheck { context: c.to_string(), app_id: None }).collect()
     }
 
     /// A `Require CI` ruleset with id `id` requiring `checks`, as `sync` writes it.
     fn require_ci(id: u64, checks: &[&str]) -> serde_json::Value {
-        let mut ruleset = require_ci_body(&unpinned(checks), &[]);
+        let mut ruleset = require_ci_body(&unpinned(checks), &[], None);
         ruleset["id"] = json!(id);
         ruleset
     }
@@ -2264,6 +2346,7 @@ assignments:
     async fn sync_keeps_require_ci_to_the_configured_checks() {
         let mut server = mockito::Server::new_async().await;
         let mut adopted = require_ci(7, &["A", "B"]);
+        adopted["enforcement"] = json!("evaluate");
         adopted["conditions"]["ref_name"]["include"] = json!(["refs/heads/main"]);
         let mut mixed = require_ci(9, &["A"]);
         mixed["rules"].as_array_mut().expect("rules").push(json!({"type": "pull_request", "parameters": {}}));
@@ -2286,10 +2369,10 @@ assignments:
         client(&server).sync(path, true).await.expect("dry run");
         assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
         client(&server).sync(path, false).await.expect("sync");
-        let body = |checks: &[&str]| require_ci_body(&unpinned(checks), &[]).to_string();
+        let body = |checks: &[&str]| require_ci_body(&unpinned(checks), &[], None).to_string();
         assert_eq!(
             *writes.lock().expect("lock"),
-            [format!("POST /repos/o/fresh/rulesets {}", body(&["A", "Clippy & Docs"])), format!("PUT /repos/o/adopt/rulesets/7 {}", body(&["A", "B"]))]
+            [format!("POST /repos/o/fresh/rulesets {}", body(&["A", "Clippy & Docs"])), format!("PUT /repos/o/adopt/rulesets/7 {}", body(&["A", "B"]).replace("~DEFAULT_BRANCH", "refs/heads/main"))]
         );
 
         let config = write_file("org: o\nrepos:\n- name: mixed\n  required_checks: [A]\n");
@@ -2418,16 +2501,16 @@ assignments:
     }
 
     #[tokio::test]
-    async fn rewriting_require_ci_keeps_the_app_each_kept_check_is_pinned_to() {
+    async fn rewriting_require_ci_keeps_live_pins_branches_and_strictness_and_sets_the_configs_pins() {
         let mut server = mockito::Server::new_async().await;
         let _mocks = mock_org_full(&mut server, &[("r", json!({}))], |_| json!([]), |_| None).await;
         // As GitHub returns it, written out by hand.
         let held = r#"{
             "id": 42, "name": "Require CI", "target": "branch", "source_type": "Repository", "source": "o/r",
             "enforcement": "active", "bypass_actors": [],
-            "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            "conditions": {"ref_name": {"include": ["refs/heads/main", "refs/heads/release/*"], "exclude": []}},
             "rules": [{"type": "required_status_checks", "parameters": {
-                "strict_required_status_checks_policy": false, "do_not_enforce_on_create": false,
+                "strict_required_status_checks_policy": true, "do_not_enforce_on_create": false,
                 "required_status_checks": [{"context": "Unit Tests", "integration_id": 15368}, {"context": "Old"}]}}],
             "node_id": "RRS_x", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
         }"#;
@@ -2436,19 +2519,119 @@ assignments:
         let _detail = server.mock("GET", "/repos/o/r/rulesets/42").with_body(held).create_async().await;
         let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let _put = record(&mut server, &writes, "PUT", "/repos/o/r/rulesets/42").await;
-        let config = write_file("org: o\nrepos:\n- name: r\n  required_checks: [Unit Tests, Lint]\n");
+        // `Unit Tests` keeps its pin though the config names no app; `Lint` gets the config's.
+        let config = write_file("org: o\nrepos:\n- name: r\n  required_checks: [Unit Tests, {context: Lint, app_id: 15368}]\n");
         client(&server).sync(config.path().to_str().expect("utf-8 path"), false).await.expect("sync");
         let writes = writes.lock().expect("lock");
         let [put] = writes.as_slice() else { panic!("{writes:?}") };
         let sent: serde_json::Value = serde_json::from_str(put.trim_start_matches("PUT /repos/o/r/rulesets/42 ")).expect("json body");
         let expected: serde_json::Value = serde_json::from_str(r#"{
             "name": "Require CI", "target": "branch", "enforcement": "active", "bypass_actors": [],
-            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "conditions": {"ref_name": {"include": ["refs/heads/main", "refs/heads/release/*"], "exclude": []}},
             "rules": [{"type": "required_status_checks", "parameters": {
-                "strict_required_status_checks_policy": false, "do_not_enforce_on_create": false,
-                "required_status_checks": [{"context": "Unit Tests", "integration_id": 15368}, {"context": "Lint"}]}}]
+                "strict_required_status_checks_policy": true, "do_not_enforce_on_create": false,
+                "required_status_checks": [{"context": "Unit Tests", "integration_id": 15368}, {"context": "Lint", "integration_id": 15368}]}}]
         }"#).expect("expected json");
         assert_eq!(sent, expected);
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_wrong_pin_is_drift_that_sync_rewrites_and_sync_from_org_writes_back() {
+        let mut server = mockito::Server::new_async().await;
+        let gate = |app_id| RequiredCheck { context: "gate / CI gate".into(), app_id };
+        let ruleset = |id: u64, app_id| {
+            let mut ruleset = require_ci_body(&[gate(app_id)], &[], None);
+            ruleset["id"] = json!(id);
+            ruleset
+        };
+        let repos = ["unpinned", "wrong", "right", "kept"].map(|n| (n, json!({})));
+        let _mocks = mock_org_full(&mut server, &repos, |_| json!([]), |name| match name {
+            "unpinned" => Some(vec![ruleset(1, None)]),
+            "wrong" => Some(vec![ruleset(2, Some(1))]),
+            "kept" => Some(vec![ruleset(4, Some(15368))]),
+            _ => Some(vec![ruleset(3, Some(15368))]),
+        }).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _puts = [
+            record(&mut server, &writes, "PUT", "/repos/o/unpinned/rulesets/1").await,
+            record(&mut server, &writes, "PUT", "/repos/o/wrong/rulesets/2").await,
+        ];
+        let pinned = "  required_checks: [{context: gate / CI gate, app_id: 15368}]\n";
+        // `kept` names the check without an app: its live pin stays, so no PUT is mocked for it.
+        let config = write_file(&format!("org: o\nrepos:\n- name: unpinned\n{pinned}- name: wrong\n{pinned}- name: right\n{pinned}- name: kept\n  required_checks: [gate / CI gate]\n"));
+        let path = config.path().to_str().expect("utf-8 path");
+        assert!(client(&server).diff(path).await.expect("diff"), "a missing or wrong pin was called a match");
+        client(&server).sync(path, false).await.expect("sync");
+        let body = require_ci_body(&[gate(Some(15368))], &[], None);
+        assert_eq!(*writes.lock().expect("lock"), [format!("PUT /repos/o/unpinned/rulesets/1 {body}"), format!("PUT /repos/o/wrong/rulesets/2 {body}")]);
+
+        let export = write_file("org: o\n");
+        let path = export.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("sync-from-org");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(repo_block(&yaml, "unpinned").contains("  required_checks:\n  - gate / CI gate"), "{yaml}");
+        assert!(repo_block(&yaml, "wrong").contains("  required_checks:\n  - context: gate / CI gate\n    app_id: 1\n"), "{yaml}");
+        for repo in ["right", "kept"] {
+            assert!(repo_block(&yaml, repo).contains("  required_checks:\n  - context: gate / CI gate\n    app_id: 15368"), "{yaml}");
+        }
+        assert!(!client(&server).diff(path).await.expect("diff"), "sync-from-org output differs from the org it came from:\n{yaml}");
+    }
+
+    #[tokio::test]
+    async fn org_actions_are_written_only_when_they_differ_and_round_trip() {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mock_org_full(&mut server, &[("r", json!({}))], |_| json!([]), |_| Some(vec![])).await;
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _put = record(&mut server, &writes, "PUT", "/orgs/o/actions/permissions/workflow").await;
+        let config = |actions: &str| write_file(&format!("org: o\nactions: {actions}\nrepos:\n- name: r\n"));
+        let locked = config("{default_workflow_permissions: read, can_approve_pull_request_reviews: false}");
+        let locked = locked.path().to_str().expect("utf-8 path");
+        client(&server).sync(locked, true).await.expect("dry run");
+        assert!(writes.lock().expect("lock").is_empty(), "a dry run wrote to GitHub");
+        client(&server).sync(locked, false).await.expect("sync");
+        let sent: Vec<serde_json::Value> = writes.lock().expect("lock").iter()
+            .map(|w| serde_json::from_str(w.trim_start_matches("PUT /orgs/o/actions/permissions/workflow ")).expect("json body"))
+            .collect();
+        assert_eq!(sent, [json!({"default_workflow_permissions": "read", "can_approve_pull_request_reviews": false})]);
+        assert!(client(&server).diff(locked).await.expect("diff"), "changed Actions settings were called a match");
+
+        writes.lock().expect("lock").clear();
+        let same = config("{default_workflow_permissions: write, can_approve_pull_request_reviews: true}");
+        client(&server).sync(same.path().to_str().expect("utf-8 path"), false).await.expect("sync");
+        assert!(writes.lock().expect("lock").is_empty(), "matching Actions settings were rewritten");
+
+        let export = write_file("org: o\n");
+        let path = export.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("sync-from-org");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(yaml.contains("actions:\n  default_workflow_permissions: write\n  can_approve_pull_request_reviews: true\n"), "{yaml}");
+        assert!(!client(&server).diff(path).await.expect("diff"), "sync-from-org output differs from the org it came from:\n{yaml}");
+        // Without the block they are unmanaged: nothing to compare.
+        let start = yaml.find("actions:").expect("actions block");
+        let end = start + yaml[start..].find("\n\n").expect("block end");
+        std::fs::write(path, format!("{}{}", &yaml[..start], &yaml[end + 2..])).expect("write config");
+        assert!(!client(&server).diff(path).await.expect("diff"), "a config without `actions` differs");
+    }
+
+    #[tokio::test]
+    async fn org_actions_that_cant_be_read_are_named_and_kept_from_a_file_that_has_them() {
+        let mut server = mockito::Server::new_async().await;
+        let mocks = mock_org_full(&mut server, &[("r", json!({}))], |_| json!([]), |_| Some(vec![])).await;
+        // The Actions settings, mocked second by `mock_org_with_teams`, give way to the 403 below.
+        mocks[1].remove_async().await;
+        let _refused = server.mock("GET", "/orgs/o/actions/permissions/workflow").with_status(403).with_body(r#"{"message": "Resource not accessible by integration"}"#).create_async().await;
+        let file = write_file("org: o\nrepos:\n- name: r\n");
+        let path = file.path().to_str().expect("utf-8 path");
+        client(&server).generate_config_and_write(path, false).await.expect("sync-from-org");
+        let yaml = std::fs::read_to_string(path).expect("read export");
+        assert!(!yaml.contains("actions:"), "{yaml}");
+        assert!(!client(&server).diff(path).await.expect("diff"), "unmanaged Actions settings were compared");
+
+        let managed = "actions:\n  default_workflow_permissions: read\n  can_approve_pull_request_reviews: false\n";
+        std::fs::write(path, format!("{managed}{yaml}")).expect("write config");
+        client(&server).generate_config_and_write(path, false).await.expect("sync-from-org");
+        assert!(std::fs::read_to_string(path).expect("read export").contains(managed), "the file's Actions settings were dropped");
+        assert!(client(&server).diff(path).await.expect("diff"), "Actions settings that couldn't be read were called a match");
     }
 
     /// A `Require CI` ruleset requiring `A`, with `bypass_actors` as given (`None`: GitHub didn't show it).

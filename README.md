@@ -247,14 +247,17 @@ repos:
 ```yaml
 repos:
   - name: service
-    required_checks: [Format, Unit Tests, "Clippy & Docs"]
+    required_checks:
+      - Format
+      - "Clippy & Docs"
+      - {context: Unit Tests, app_id: 15368}   # only GitHub Actions may post it
     required_checks_bypass:       # optional: who may merge past the checks, and how
       - team: core-team
         mode: pull_request        # only by merging a PR; `always` also allows direct pushes
 ```
 
-- `sync` keeps them in the repo's own ruleset named `Require CI`: active, on the default branch (`~DEFAULT_BRANCH`), not strict (a PR needn't be up to date with the branch), one `required_status_checks` rule. It creates the ruleset if the repo has none by that name and rewrites it when its checks (in any order) or any of those properties differ. An existing `Require CI` ruleset is adopted by name.
-- A check the ruleset already pins to an app (`integration_id`, e.g. GitHub Actions) keeps that pin when `sync` rewrites the ruleset; a new check gets none. The pin isn't part of the config or the drift check.
+- `sync` keeps them in the repo's own ruleset named `Require CI`: active, enforced on branch creation too, one `required_status_checks` rule. A ruleset it creates covers the default branch (`~DEFAULT_BRANCH`) and isn't strict (a PR needn't be up to date with the branch). It rewrites the ruleset when its checks (in any order), the bypass list, or those properties differ, and keeps the branches it covers and its strictness, so a rewrite never covers fewer branches or stops requiring PRs to be up to date. An existing `Require CI` ruleset is adopted by name; one that targets tags or pushes, or has no branch conditions, is refused.
+- A check is its name, which any app may post, or `{context: <name>, app_id: <id>}`, which only that GitHub App may post (the ruleset's `integration_id`; GitHub Actions is `15368`). A pin is set or changed only by an `app_id` in the config: a ruleset whose check has no pin, or another app's, is rewritten by `sync` and shown by `diff`. A plain name keeps the pin the ruleset has, so `sync` never removes one; to remove a pin, change the ruleset on GitHub. `sync-from-org` writes each pin back, so `diff` shows a pin the file doesn't name until the file records it. A pin stops another app or a commit status (which has no app) from satisfying the check; it doesn't stop a workflow in the PR itself from posting a check run with the same name.
 - `allow_auto_merge` is written after the repo's `Require CI` ruleset, so if the ruleset write fails, auto-merge isn't left on without the checks it waits for.
 - A name listed twice is refused when the config is loaded. A `Require CI` ruleset that requires one check twice (from different apps) is refused like one with another rule: a config can't say which pin to keep.
 - gh-config owns every rule in `Require CI`: if it holds any other rule, `sync` stops with an error naming the repo and the rule instead of dropping it. Keep other rules in other rulesets.
@@ -262,6 +265,19 @@ repos:
 - `sync --dry-run` names the checks an update would stop requiring, who may bypass them after it and who no longer may.
 - A repo with no `required_checks` is left alone: `sync` doesn't read or delete its rulesets. To stop requiring checks, delete the ruleset on GitHub and the key.
 - `sync-from-org` records the checks of each repo's `Require CI` ruleset, in the file's order when the file names the same ones; `diff` compares them as a set. It costs one rulesets request per repo, plus one when `Require CI` exists. A ruleset that can't be read keeps what the file has, and `diff` names the repo and exits 1. It records the bypass list too, reading team ids as slugs (one teams request in all). GitHub shows a ruleset's bypass list only to a token that can administer the repo; when it doesn't, or the list holds anything other than the org's teams, the file's list is kept and `diff` names the repo and exits 1. A ruleset that requires no checks is recorded without them and without a bypass list (a config can't hold a bypass list alone), and `sync-from-org` never writes a config that wouldn't load: it stops and leaves the file as it is. Properties other than the checks and the bypass list aren't recorded, so `diff` shows no change when only those differ; `sync` still corrects them.
+
+### Org Actions settings
+
+```yaml
+actions:
+  default_workflow_permissions: read          # read or write: what a workflow's GITHUB_TOKEN gets by default
+  can_approve_pull_request_reviews: false     # whether Actions may create and approve PRs
+```
+
+- The org's Actions workflow settings (GitHub's `/orgs/{org}/actions/permissions/workflow`). Both keys are required; leave the whole block out and `sync` leaves them alone and `diff` doesn't compare them.
+- `sync` reads them and writes both, with one PUT, only when they differ; `--dry-run` prints the change. It writes them after checking the config's bypass lists and before teams and repos.
+- The token needs the org's administration permission: a GitHub App needs **Organization permissions → Administration: Read** for `sync-from-org` and `diff` (GET) and **Read and write** for `sync` (PUT); a classic PAT needs `admin:org`. Grant it before adding the block.
+- `sync-from-org` records them. If they can't be read (no permission, an error, a response it doesn't understand), it logs the error and names them in its last line instead of reporting success. A file that has the block keeps it, and `diff` names the org and exits 1; a file without it stays without it, and `diff` doesn't compare them.
 
 ### Webhooks
 
