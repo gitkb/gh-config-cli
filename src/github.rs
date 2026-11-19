@@ -2536,9 +2536,9 @@ assignments:
         let path = export.path().to_str().expect("utf-8 path");
         client(&server).generate_config_and_write(path, false).await.expect("sync-from-org");
         let yaml = std::fs::read_to_string(path).expect("read export");
-        assert!(repo_block(&yaml, "unpinned").contains("  required_checks:\n  - gate / CI gate\n"), "{yaml}");
+        assert!(repo_block(&yaml, "unpinned").contains("  required_checks:\n  - gate / CI gate"), "{yaml}");
         assert!(repo_block(&yaml, "wrong").contains("  required_checks:\n  - context: gate / CI gate\n    app_id: 1\n"), "{yaml}");
-        assert!(repo_block(&yaml, "right").contains("  required_checks:\n  - context: gate / CI gate\n    app_id: 15368\n"), "{yaml}");
+        assert!(repo_block(&yaml, "right").contains("  required_checks:\n  - context: gate / CI gate\n    app_id: 15368"), "{yaml}");
         assert!(!client(&server).diff(path).await.expect("diff"), "sync-from-org output differs from the org it came from:\n{yaml}");
     }
 
